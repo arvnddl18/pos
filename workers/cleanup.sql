@@ -1,0 +1,12 @@
+DELETE FROM audit_events WHERE entity_id IN (SELECT id FROM tickets WHERE id LIKE 'seed-ticket-%');
+DELETE FROM audit_events WHERE id LIKE 'seed-audit-%';
+DELETE FROM payments WHERE ticket_id IN (SELECT id FROM tickets WHERE id LIKE 'seed-ticket-%');
+DELETE FROM refunds WHERE ticket_id IN (SELECT id FROM tickets WHERE id LIKE 'seed-ticket-%');
+DELETE FROM line_items WHERE ticket_id IN (SELECT id FROM tickets WHERE id LIKE 'seed-ticket-%');
+DELETE FROM line_items WHERE product_id IN ('prod-americano', 'prod-latte', 'prod-cappuccino', 'prod-mocha');
+DELETE FROM tickets WHERE id LIKE 'seed-ticket-%';
+DELETE FROM product_modifier_groups WHERE product_id IN ('prod-americano', 'prod-latte', 'prod-cappuccino', 'prod-mocha');
+DELETE FROM menu_products WHERE product_id IN ('prod-americano', 'prod-latte', 'prod-cappuccino', 'prod-mocha');
+DELETE FROM products WHERE id IN ('prod-americano', 'prod-latte', 'prod-cappuccino', 'prod-mocha');
+DELETE FROM categories WHERE id = 'cat-coffee-seed';
+DELETE FROM tax_profiles WHERE id = 'tax-standard-seed';

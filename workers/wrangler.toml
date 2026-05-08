@@ -1,0 +1,22 @@
+name = "pos-api"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+[vars]
+ENVIRONMENT = "development"
+# Comma-separated exact browser origins allowed for POST/PUT/PATCH/DELETE (leave empty to disable)
+ALLOWED_ORIGINS = ""
+
+[[d1_databases]]
+binding = "DB"
+database_name = "pos-db"
+database_id = "local-dev-replace-with-wrangler-output"
+
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "pos-assets"
+
+# Set with: wrangler secret put SESSION_SECRET — signs the pos_session cookie (HMAC-SHA256 over session id).
+
+[dev]
+port = 8787

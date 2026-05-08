@@ -1,0 +1,4 @@
+# HMAC key for signed session cookies (recommended in production). Omit locally for plain UUID cookies.
+SESSION_SECRET=change-me-in-production
+# Optional: restrict mutating browser requests to these exact origins (comma-separated)
+# ALLOWED_ORIGINS=https://localhost:5173,https://pos.example.com

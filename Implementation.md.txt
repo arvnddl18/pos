@@ -1,0 +1,109 @@
+# AI-Powered POS System Integration Plan
+
+This document outlines the structured plan, functional and non-functional requirements, and the business value analysis for integrating AI-powered features into your existing POS system. 
+
+The plan is based on the insights from [MobiDev's AI POS upgrade guide](https://mobidev.biz/blog/upgrade-pos-point-of-sale-software-with-ai) and is carefully aligned with your specific goals for **Descriptive Analytics**, **Predictive Analytics**, **Churn Analysis**, and **Trend Awareness**.
+
+## User Review Required
+
+> [!IMPORTANT]
+> Please review the proposed Functional and Non-Functional Requirements below. Let me know if these align with your vision, or if there are specific models/features you want to prioritize first.
+
+## Website Analysis: Key Features & Business Value
+
+Based on the MobiDev article, here are the top AI use cases for POS systems and their summarized business value:
+
+1. **AI-Driven Demand Forecasting**
+   - **Value:** Supports strategic pricing planning, improves demand prediction for inventory planning, and enables efficient resource allocation. 
+   - **Alignment:** Directly fulfills your **Predictive Analytics** and **Trend Awareness** goals by anticipating consumer demand based on seasonal/daily trends.
+2. **AI-Driven Sales Data Analytics**
+   - **Value:** Provides up-to-date insights, minimizes stockouts, optimizes pricing strategies, and tracks sales performance metrics effectively.
+   - **Alignment:** Directly fulfills your **Descriptive Analytics** goals.
+3. **Intelligent Inventory Management**
+   - **Value:** Reduces manual intervention, improves inventory tracking, and provides better decision-making through valuable insights into inventory performance.
+   - **Alignment:** Acts on the insights generated from predictive analytics.
+4. **Smart Personalized Recommendations**
+   - **Value:** Enhances customer experience and increases sales/revenue through upselling and cross-selling.
+   - **Alignment:** Can be utilized alongside **Churn Analysis** to offer targeted promotions for customer retention.
+5. **Automated Identity and Age Verification**
+   - **Value:** Reduces risk of legal penalties, prevents identity fraud. (Optional - less aligned with your primary analytics goals but useful for customer profiling).
+
+---
+
+## Requirements Document
+
+### Functional Requirements
+
+1. **Data Ingestion & Aggregation**
+   - The system must collect and aggregate historical sales data, customer demographics, feedback, and inventory levels.
+   - The system must establish an automated ETL (Extract, Transform, Load) pipeline to supply data to the AI models.
+2. **Descriptive Analytics & Reporting Module**
+   - The system must generate visual reports tracking past sales performance, identifying most/least selling products, and summarizing customer demographics.
+   - **User-Friendly Requirement:** Reports must use clean, interactive charts with clear tooltips and straightforward language.
+3. **Predictive Demand & Sales Forecasting Module**
+   - The system must generate daily, weekly, and monthly demand forecasts for individual products based on historical patterns and seasonality.
+   - The system must allow users to view correlations between forecasted numbers and actual sales.
+   - **User-Friendly Requirement:** Forecasts should be presented as clear visual trends, automatically highlighting anomalies so managers know exactly where to focus without needing data science knowledge.
+4. **Customer Churn Analysis Module**
+   - The system must identify customers at high risk of attrition based on purchase frequency, spending drops, and negative feedback.
+   - **User-Friendly Requirement:** Display at-risk customers in a simple, actionable list with suggested retention actions (e.g., "Send 10% discount").
+5. **Smart Recommendation Engine (Optional/Future)**
+   - The system must suggest products to customers or cashiers based on associative rules (items frequently bought together).
+
+### Non-Functional Requirements
+
+1. **Data Prerequisites**
+   - The forecasting models require a minimum of 3 months of historical data to produce baseline predictions, and ideally 12 months for accurate seasonal adjustments.
+2. **Performance & Automation**
+   - Model retraining and data pipelines must run automatically as scheduled jobs (e.g., nightly during quiet hours) to ensure up-to-date analytics without impacting POS operational performance.
+3. **Usability (UI/UX) & User-Friendliness**
+   - The analytical dashboards must be highly intuitive and easy to use for non-technical staff.
+   - The UI should automatically highlight anomalies and deviations in predictions so managers know where to focus their attention.
+   - Complex data should be abstracted behind clean visualizations (charts, graphs, color-coded indicators).
+4. **Scalability & Architecture**
+   - The AI backend should be decoupled from the primary transactional POS database to prevent heavy analytical queries from slowing down real-time checkout processes.
+5. **Security & Privacy**
+   - All customer data used for training models must be sanitized and anonymized to protect Personally Identifiable Information (PII).
+
+---
+
+## Proposed Implementation Plan
+
+### Phase 1: Data Infrastructure & Mock Data Generation
+- **Goal:** Establish a robust data pipeline and simulate historical data for model training.
+- **Tasks:**
+  - Create a mock data generation script to simulate 6-12 months of realistic historical sales, customer behaviors, and inventory changes. This is necessary because the system currently lacks the historical data required to train AI models.
+  - Set up a scheduled worker (e.g., via Cloudflare Cron Triggers) to aggregate and sanitize daily transaction data into an analytical data store or format.
+
+### Phase 2: Descriptive & Churn Analytics
+- **Goal:** Implement reporting and identify at-risk customers.
+- **Tasks:**
+  - Build endpoints in `analytics.ts` to serve descriptive stats (sales over time, top products).
+  - Implement a basic heuristic or ML-based churn model analyzing the `customers` and `tickets` tables (e.g., customers who haven't purchased in X days compared to their usual frequency).
+  - Create the UI dashboard in the React frontend to visualize these insights.
+
+### Phase 3: Predictive Analytics (Demand Forecasting)
+- **Goal:** Implement the forecasting models.
+- **Tasks:**
+  - Develop a time-series forecasting model (could be a lightweight model run via Cloudflare Workers AI or an external API) using historical sales data.
+  - Implement endpoints to serve demand predictions for the upcoming week/month.
+  - Update the frontend dashboard to display forecasted vs. actual sales charts.
+
+### Phase 4: Testing & Iteration
+- **Goal:** Validate model accuracy and UI usability.
+- **Tasks:**
+  - Backtest the forecasting models against historical data.
+  - Gather user feedback on the dashboard's usability and the usefulness of the insights.
+
+## Open Questions
+
+> [!TIP]
+> **What kind of "AI" is the Free Solution?** 
+> To answer your question: Yes, it will "learn" from the data! We will use **Statistical Machine Learning** (like Linear Regression and Exponential Smoothing). Every day, the algorithm looks at the new sales data and automatically adjusts its internal math to improve future predictions. It will output **structured numerical analysis** (e.g., "Predicted demand for Item A is 45 units next week"). 
+>
+> *Note on Generative AI:* If by "structured analysis" you mean you want an AI to write a human-readable summary (e.g., "Sales of coffee are up 20% this week, you should stock more milk"), we would need to use a Large Language Model (LLM). Cloudflare Workers AI offers LLMs with a free tier of 10,000 requests per day. Running a daily summary report will easily fit into this free tier forever. 
+> 
+> **Our Plan:** We will build the unlimited, free statistical models for numerical predictions, and optionally add a daily LLM summary report using Cloudflare's free tier!
+
+> [!WARNING]
+> Please confirm if you approve of Phase 1 (generating synthetic/mock data to train the models initially) so we can begin the implementation!
