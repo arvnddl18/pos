@@ -2,6 +2,12 @@ import { Hono } from "hono";
 import { requireAuth } from "../middleware/session.js";
 import { requireManager } from "../middleware/rbac.js";
 import type { AppEnv } from "../ctx.js";
+import {
+  getHistoricalSalesData,
+  generateForecastWithAI,
+  generateStatisticalForecast,
+  type DailyForecast,
+} from "../lib/forecasting.js";
 
 export const analyticsRoutes = new Hono<AppEnv>();
 
@@ -188,4 +194,141 @@ analyticsRoutes.get("/feedback", requireAuth(), requireManager(), async (c) => {
   ).bind(auth.orgId).all();
 
   return c.json({ feedbacks: results.results ?? [] });
+});
+
+// Demand Forecasting (AI-powered)
+analyticsRoutes.get("/forecast/7day", requireAuth(), requireManager(), async (c) => {
+  const auth = c.get("auth")!;
+  const daysBack = Number(c.req.query("daysBack") || 30);
+  const useAI = c.req.query("useAI") !== "false";
+
+  try {
+    // Get historical data
+    const historicalData = await getHistoricalSalesData(
+      c.env.DB,
+      auth.orgId,
+      daysBack
+    );
+
+    if (historicalData.length === 0) {
+      return c.json(
+        { error: "Insufficient historical data for forecasting" },
+        400
+      );
+    }
+
+    let forecasts: DailyForecast[];
+
+    // Try to use AI if available
+    if (
+      useAI &&
+      c.env.OPENROUTER_API_KEY &&
+      c.env.OPENROUTER_MODEL
+    ) {
+      try {
+        forecasts = await generateForecastWithAI(
+          c.env.OPENROUTER_API_KEY,
+          c.env.OPENROUTER_MODEL,
+          historicalData
+        );
+      } catch (aiError) {
+        console.warn("AI forecasting failed, falling back to statistical:", aiError);
+        // Fall back to statistical forecasting
+        forecasts = generateStatisticalForecast(historicalData);
+      }
+    } else {
+      // Use statistical forecasting
+      forecasts = generateStatisticalForecast(historicalData);
+    }
+
+    return c.json({
+      forecasts,
+      usedAI: useAI && c.env.OPENROUTER_API_KEY ? true : false,
+      historicalDataPoints: historicalData.reduce(
+        (sum, p) => sum + p.dailyData.length,
+        0
+      ),
+    });
+  } catch (error) {
+    console.error("Forecasting error:", error);
+    return c.json(
+      { error: "Failed to generate forecast", details: String(error) },
+      500
+    );
+  }
+});
+
+// Product-specific forecast
+analyticsRoutes.get("/forecast/product/:productId", requireAuth(), requireManager(), async (c) => {
+  const auth = c.get("auth")!;
+  const productId = c.req.param("productId");
+  const daysBack = Number(c.req.query("daysBack") || 30);
+
+  try {
+    const historicalData = await getHistoricalSalesData(
+      c.env.DB,
+      auth.orgId,
+      daysBack
+    );
+
+    const productData = historicalData.find((p) => p.productId === productId);
+
+    if (!productData) {
+      return c.json({ error: "Product not found in historical data" }, 404);
+    }
+
+    const forecasts = generateStatisticalForecast([productData]);
+
+    return c.json({
+      productId,
+      productName: productData.productName,
+      forecasts: forecasts.map((f) => ({
+        date: f.date,
+        forecastedUnits: f.byProduct[0]?.forecastedUnits || 0,
+        confidence: f.byProduct[0]?.confidence || 0.7,
+      })),
+    });
+  } catch (error) {
+    console.error("Product forecast error:", error);
+    return c.json(
+      { error: "Failed to generate product forecast", details: String(error) },
+      500
+    );
+  }
+});
+
+// Forecast comparison (forecasted vs actual)
+analyticsRoutes.get("/forecast/accuracy", requireAuth(), requireManager(), async (c) => {
+  const auth = c.get("auth")!;
+
+  try {
+    // Get forecast data
+    const forecastRes = await c.env.DB.prepare(
+      `SELECT 
+        DATE(created_at) as forecast_date,
+        COUNT(DISTINCT id) as actual_tickets,
+        SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) as paid_tickets
+      FROM tickets
+      WHERE org_id = ? AND DATE(created_at) >= DATE('now', '-14 days')
+      GROUP BY DATE(created_at)
+      ORDER BY forecast_date DESC`
+    )
+      .bind(auth.orgId)
+      .all();
+
+    // Generate current forecast for comparison
+    const historicalData = await getHistoricalSalesData(c.env.DB, auth.orgId, 30);
+    const forecasts = generateStatisticalForecast(historicalData);
+
+    return c.json({
+      actual: forecastRes.results ?? [],
+      forecast: forecasts.slice(0, 7),
+    });
+  } catch (error) {
+    console.error("Accuracy check error:", error);
+    return c.json(
+      { error: "Failed to check forecast accuracy", details: String(error) },
+      500
+    );
+  }
 });

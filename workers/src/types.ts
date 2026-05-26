@@ -5,4 +5,6 @@ export type Env = {
   ENVIRONMENT?: string;
   /** Comma-separated exact origins (e.g. https://pos.example.com) for mutating API requests */
   ALLOWED_ORIGINS?: string;
+  OPENROUTER_API_KEY?: string;
+  OPENROUTER_MODEL?: string;
 };

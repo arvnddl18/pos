@@ -1,6 +1,9 @@
 name = "pos-api"
+# Replace this with your Cloudflare account ID if you want explicit deployment targeting.
+# You can get it with `wrangler whoami` or from your Cloudflare dashboard.
+account_id = "b8e467e15307d22f8c72bb963aa9162c"
 main = "src/index.ts"
-compatibility_date = "2024-11-01"
+compatibility_date = "2026-01-01"
 
 [vars]
 ENVIRONMENT = "development"
@@ -10,11 +13,14 @@ ALLOWED_ORIGINS = ""
 [[d1_databases]]
 binding = "DB"
 database_name = "pos-db"
-database_id = "local-dev-replace-with-wrangler-output"
+database_id = "e7c76c3d-1111-4eca-b59c-f891821d4e15"
 
-[[r2_buckets]]
-binding = "R2_BUCKET"
-bucket_name = "pos-assets"
+[env.production]
+vars = { ENVIRONMENT = "production", ALLOWED_ORIGINS = "https://pos-api-production.arvnddl18.workers.dev" }
+
+# [[r2_buckets]]
+# binding = "R2_BUCKET"
+# bucket_name = "pos-assets"
 
 # Set with: wrangler secret put SESSION_SECRET — signs the pos_session cookie (HMAC-SHA256 over session id).
 

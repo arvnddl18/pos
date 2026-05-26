@@ -41,7 +41,7 @@ function KpiCard({ label, value, sub }: { label: string; value: string; sub?: st
 }
 
 export function ReportsPage() {
-  const [tab, setTab] = useState<"eod" | "analytics" | "feedback" | "audit">("eod");
+  const [tab, setTab] = useState<"eod" | "analytics" | "forecast" | "feedback" | "audit">("eod");
   const [demo, setDemo] = useState("");
   const [filterOpen, setFilterOpen] = useState(false);
   const activeLabel = DEMOGRAPHICS.find(d => d.value === demo)?.label ?? "All Profiles";
@@ -78,6 +78,9 @@ export function ReportsPage() {
   const [products, setProducts] = useState<any[]>([]);
   const [feedbacks, setFeedbacks] = useState<any[]>([]);
   const [feedbackModalTicketId, setFeedbackModalTicketId] = useState<string | null>(null);
+  const [forecast, setForecast] = useState<any>(null);
+  const [forecastLoading, setForecastLoading] = useState(false);
+  const [forecastError, setForecastError] = useState<string | null>(null);
 
   const demoQ = demo ? `&demographic=${encodeURIComponent(demo)}` : "";
 
@@ -101,12 +104,24 @@ export function ReportsPage() {
     const dq = buildDateQ();
     api<{ feedbacks: any[] }>(`/analytics/feedback?x=1${demoQ}${dq}`).then(r => setFeedbacks(r.feedbacks ?? [])).catch(() => setFeedbacks([]));
   }
+  function refreshForecast() {
+    setForecastLoading(true);
+    setForecastError(null);
+    api<any>(`/analytics/forecast/7day?x=1`).then(r => {
+      setForecast(r);
+      setForecastLoading(false);
+    }).catch(err => {
+      setForecastError(err?.error || "Failed to load forecast");
+      setForecastLoading(false);
+    });
+  }
 
   useEffect(() => {
     if (tab === "eod") refreshEod();
     else if (tab === "audit") refreshAudit();
     else if (tab === "analytics") refreshAnalytics();
     else if (tab === "feedback") refreshFeedback();
+    else if (tab === "forecast") refreshForecast();
   }, [tab, demo, dateType, dateDay, dateFrom, dateTo, dateMonth]);
 
   async function submitRetroactiveFeedback(e: FormEvent<HTMLFormElement>) {
@@ -128,9 +143,9 @@ export function ReportsPage() {
         <h1 className="page-title" style={{ margin: 0, fontSize: "2rem", color: "var(--text)" }}>Reports & Analytics</h1>
         <div className="row" style={{ gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <div className="row" style={{ gap: 8, background: "var(--panel)", padding: 6, borderRadius: 16, border: "1px solid var(--border)", flexWrap: "wrap" }}>
-            {(["eod","analytics","feedback","audit"] as const).map(t => (
+            {(["eod","analytics","forecast","feedback","audit"] as const).map(t => (
               <button key={t} type="button" className={tab === t ? "primary-btn" : "ghost-btn"} onClick={() => setTab(t)}>
-                {t === "eod" ? "Sales Summary" : t === "analytics" ? "Analytics & KPI" : t === "feedback" ? "Customer Feedback" : "Audit Logs"}
+                {t === "eod" ? "Sales Summary" : t === "analytics" ? "Analytics & KPI" : t === "forecast" ? "📈 AI Forecast" : t === "feedback" ? "Customer Feedback" : "Audit Logs"}
               </button>
             ))}
           </div>
@@ -552,6 +567,167 @@ export function ReportsPage() {
                 {f.feedback_notes && <div style={{ marginTop: 12, fontStyle: "italic", padding: "12px 16px", background: "var(--panel)", borderRadius: 10, borderLeft: "4px solid var(--accent-soft)", color: "var(--text)" }}>"{f.feedback_notes}"</div>}
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── AI FORECAST ── */}
+      {tab === "forecast" && (
+        <div style={{ overflowY: "auto", maxHeight: "calc(100vh - 180px)", paddingRight: 4 }}>
+          <div className="stack" style={{ gap: 18 }}>
+            {/* Header */}
+            <div className="row" style={{ gap: 12, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
+              <div className="stack" style={{ gap: 4 }}>
+                <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: "var(--text)" }}>📈 AI-Powered Demand Forecast</h2>
+                <p className="muted" style={{ margin: 0, fontSize: 12 }}>Next 7 days predicted sales using historical patterns</p>
+              </div>
+              <button 
+                type="button" 
+                className={forecastLoading ? "ghost-btn" : "primary-btn"} 
+                onClick={refreshForecast}
+                disabled={forecastLoading}
+                style={{ minWidth: 140 }}>
+                {forecastLoading ? "⟳ Loading..." : "🔄 Refresh"}
+              </button>
+            </div>
+
+            {/* Error State */}
+            {forecastError && (
+              <div style={{ padding: "14px 16px", background: "#ef4444", color: "#fff", borderRadius: 12, border: "1px solid #ef4444", fontSize: 13 }}>
+                <strong>⚠ Error:</strong> {forecastError}
+              </div>
+            )}
+
+            {/* Loading State */}
+            {forecastLoading && (
+              <div style={{ textAlign: "center", padding: "40px 20px", color: "var(--muted)" }}>
+                <div style={{ fontSize: 14, marginBottom: 12 }}>Computing forecast with AI model...</div>
+                <div style={{ animation: "spin 1s linear infinite", display: "inline-block", fontSize: 24 }}>⟳</div>
+              </div>
+            )}
+
+            {/* Forecast Content */}
+            {forecast && !forecastLoading && (
+              <div className="stack" style={{ gap: 16 }}>
+                {/* Model Info */}
+                <div className="row" style={{ gap: 16, flexWrap: "wrap", padding: "12px 16px", background: "var(--bg-elevated)", borderRadius: 12, border: "1px solid var(--border)" }}>
+                  <div className="stack" style={{ gap: 2, flex: 1 }}>
+                    <div className="muted" style={{ fontSize: 11, textTransform: "uppercase", fontWeight: 700 }}>Model</div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>
+                      {forecast.usedAI ? "🧠 Nemotron 3 Super (OpenRouter)" : "📊 Statistical Forecast"}
+                    </div>
+                  </div>
+                  <div className="stack" style={{ gap: 2, flex: 1 }}>
+                    <div className="muted" style={{ fontSize: 11, textTransform: "uppercase", fontWeight: 700 }}>Historical Data</div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>
+                      {forecast.historicalDataPoints || 0} data points
+                    </div>
+                  </div>
+                </div>
+
+                {/* 7-Day Forecast Chart */}
+                {forecast.forecasts && forecast.forecasts.length > 0 && (
+                  <div className="card stack" style={{ gap: 12 }}>
+                    <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>7-Day Forecast</h3>
+                    <div className="muted" style={{ fontSize: 12 }}>Predicted daily order volume</div>
+                    <ResponsiveContainer width="100%" height={250}>
+                      <BarChart 
+                        data={forecast.forecasts.map((f: any) => ({
+                          date: new Date(f.date).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+                          units: f.totalForecastedUnits,
+                          fullDate: f.date,
+                        }))}
+                        margin={{ top: 0, right: 8, bottom: 0, left: -10 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} />
+                        <XAxis dataKey="date" stroke={ct.axis} tick={{ fontSize: 10 }} />
+                        <YAxis stroke={ct.axis} tick={{ fontSize: 10 }} />
+                        <Tooltip 
+                          contentStyle={{ backgroundColor: ct.bg, border: `1px solid ${ct.grid}`, borderRadius: 10, color: "var(--text)", fontSize: 12 }}
+                          formatter={(v: any) => [`${v} units`, "Forecasted"]}
+                          labelFormatter={(label) => `Forecast: ${String(label)}`}
+                        />
+                        <Bar dataKey="units" name="Forecasted Units" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+
+                    {/* Daily Breakdown */}
+                    <div className="stack" style={{ gap: 8, marginTop: 12 }}>
+                      {forecast.forecasts.slice(0, 7).map((day: any, i: number) => (
+                        <div key={i} className="row" style={{ justifyContent: "space-between", alignItems: "center", padding: "12px 14px", background: "var(--bg)", borderRadius: 10, border: "1px solid var(--border)" }}>
+                          <div className="stack" style={{ gap: 2, flex: 1 }}>
+                            <div style={{ fontWeight: 700, fontSize: 13, color: "var(--text)" }}>
+                              {new Date(day.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
+                            </div>
+                            <div className="muted" style={{ fontSize: 11 }}>
+                              {day.byProduct.length} products
+                            </div>
+                          </div>
+                          <div className="stack" style={{ gap: 2, alignItems: "flex-end" }}>
+                            <div style={{ fontSize: 18, fontWeight: 800, color: "var(--accent-strong)" }}>
+                              {day.totalForecastedUnits}
+                            </div>
+                            <div className="muted" style={{ fontSize: 11 }}>units</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Product Breakdown */}
+                {forecast.forecasts && forecast.forecasts[0]?.byProduct && (
+                  <div className="card stack" style={{ gap: 12 }}>
+                    <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>Product Forecast Breakdown</h3>
+                    <div className="muted" style={{ fontSize: 12 }}>Predicted units per product across 7 days</div>
+                    
+                    {/* Product rows */}
+                    <div className="stack" style={{ gap: 8 }}>
+                      {forecast.forecasts[0].byProduct.map((product: any, i: number) => {
+                        const total = forecast.forecasts.reduce((sum: number, day: any) => {
+                          const p = day.byProduct.find((bp: any) => bp.productName === product.productName);
+                          return sum + (p?.forecastedUnits || 0);
+                        }, 0);
+                        
+                        return (
+                          <div key={i} className="row" style={{ justifyContent: "space-between", alignItems: "center", padding: "10px 12px", background: "var(--bg)", borderRadius: 8, border: "1px solid var(--border)" }}>
+                            <div className="stack" style={{ gap: 2, flex: 1 }}>
+                              <div style={{ fontWeight: 600, fontSize: 13, color: "var(--text)" }}>{product.productName}</div>
+                              <div className="muted" style={{ fontSize: 10 }}>7-day total: {total} units</div>
+                            </div>
+                            <div style={{ fontSize: 16, fontWeight: 800, color: "#22c55e" }}>{total}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Insights */}
+                <div className="card stack" style={{ gap: 10, background: "color-mix(in srgb, var(--accent) 8%, transparent)", border: "1px solid color-mix(in srgb, var(--accent) 20%, transparent)" }}>
+                  <h3 style={{ margin: 0, fontWeight: 700, fontSize: 14, color: "var(--accent-strong)" }}>💡 Model Insights</h3>
+                  <div style={{ fontSize: 13, color: "var(--text)", lineHeight: 1.6 }}>
+                    <p style={{ margin: "0 0 8px 0" }}>
+                      This forecast is generated using <strong>{forecast.usedAI ? "advanced AI analysis" : "statistical modeling"}</strong> based on your historical sales data.
+                    </p>
+                    {forecast.usedAI && (
+                      <p style={{ margin: "0 0 8px 0" }}>
+                        The model considers weekly patterns, customer demographics, and seasonal trends to predict demand for the next week.
+                      </p>
+                    )}
+                    <p style={{ margin: 0, fontSize: 12, color: "var(--muted)" }}>
+                      ℹ Forecasts become more accurate as more historical data accumulates. Currently using {forecast.historicalDataPoints} data points.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Empty State */}
+            {!forecast && !forecastLoading && !forecastError && (
+              <div className="card" style={{ padding: "40px 24px", textAlign: "center", color: "var(--muted)" }}>
+                <div style={{ fontSize: 14, marginBottom: 12 }}>Click "Refresh" to generate a 7-day demand forecast</div>
+              </div>
+            )}
           </div>
         </div>
       )}

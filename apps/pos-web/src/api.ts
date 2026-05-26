@@ -1,4 +1,4 @@
-export const API_BASE = "/api";
+export const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
 const CSRF_KEY = "csrfToken";
 
 function setCsrfToken(token: string | undefined) {
@@ -43,11 +43,25 @@ export async function api<T = unknown>(path: string, init?: RequestInit & { json
   });
   if (res.status === 204) return undefined as T;
   const text = await res.text();
-  const data = text ? JSON.parse(text) : undefined;
+  const contentType = res.headers.get("Content-Type") ?? "";
+  let data: unknown;
+  if (contentType.includes("application/json")) {
+    try {
+      data = text ? JSON.parse(text) : undefined;
+    } catch {
+      data = text;
+    }
+  } else {
+    data = text || undefined;
+  }
   const maybeCsrf = (data as { csrfToken?: string } | undefined)?.csrfToken;
   if (maybeCsrf) setCsrfToken(maybeCsrf);
   if (!res.ok) {
-    const err = new Error((data as { error?: string })?.error ?? res.statusText);
+    const errMessage =
+      typeof data === "object" && data !== null && "error" in data
+        ? String((data as { error?: unknown }).error ?? res.statusText)
+        : String(text || res.statusText);
+    const err = new Error(errMessage);
     (err as Error & { status?: number; body?: unknown }).status = res.status;
     (err as Error & { body?: unknown }).body = data;
     throw err;
