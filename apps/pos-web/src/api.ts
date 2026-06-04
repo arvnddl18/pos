@@ -52,6 +52,9 @@ export async function api<T = unknown>(path: string, init?: RequestInit & { json
       data = text;
     }
   } else {
+    if (res.ok && contentType.includes("text/html")) {
+      throw new Error(`Expected JSON response from API, but received HTML (likely static site fallback). Status: ${res.status}`);
+    }
     data = text || undefined;
   }
   const maybeCsrf = (data as { csrfToken?: string } | undefined)?.csrfToken;

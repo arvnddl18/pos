@@ -4,8 +4,8 @@ import type { AppEnv } from "../ctx.js";
 import { requireAuth } from "../middleware/session.js";
 import { requireManager } from "../middleware/rbac.js";
 import { writeAudit } from "../audit.js";
-import { validateModifierSelection } from "../lib/modifiers.js";
-import { computeTicketTotals, sumLineSubtotalCentavos, getTicketAdjustments } from "../lib/ticket_totals.js";
+import { resolveLineItemPricing } from "../lib/line_pricing.js";
+import { computeTicketTotals, sumLineSubtotalCentavos, getTicketAdjustments, computeTicketTotalsFromRows } from "../lib/ticket_totals.js";
 import { buildReceiptPayload } from "./receipt_helpers.js";
 
 export const ticketRoutes = new Hono<AppEnv>();
@@ -21,8 +21,11 @@ async function ticketTotalsPayload(db: D1Database, ticketId: string) {
   const t = await computeTicketTotals(db, ticketId);
   const paid = await sumCompletedPayments(db, ticketId);
   return {
+    lineGrossCentavos: t.lineGrossCentavos,
+    lineItemDiscountCentavos: t.lineItemDiscountCentavos,
     lineSubtotalCentavos: t.lineSubtotalCentavos,
     orderDiscountCentavos: t.orderDiscountCentavos,
+    totalDiscountCentavos: t.totalDiscountCentavos,
     serviceChargeCentavos: t.serviceChargeCentavos,
     tipCentavos: t.tipCentavos,
     taxCentavos: t.taxCentavos,
@@ -31,6 +34,64 @@ async function ticketTotalsPayload(db: D1Database, ticketId: string) {
     paidCompletedCentavos: paid,
     remainingDueCentavos: Math.max(0, t.dueCentavos - paid),
   };
+}
+
+export async function getTicketDetailPayload(db: D1Database, ticketId: string, orgId: string) {
+  const batchRes = await db.batch([
+    db.prepare(`SELECT * FROM tickets WHERE id = ? AND org_id = ?`).bind(ticketId, orgId),
+    db.prepare(
+      `SELECT li.*, p.name as product_name, tp.rate_bps
+       FROM line_items li
+       JOIN products p ON p.id = li.product_id
+       LEFT JOIN tax_profiles tp ON tp.id = p.tax_profile_id
+       WHERE li.ticket_id = ?
+       ORDER BY li.sort_order`
+    ).bind(ticketId),
+    db.prepare(`SELECT * FROM payments WHERE ticket_id = ? ORDER BY created_at`).bind(ticketId)
+  ]);
+
+  const t = batchRes[0].results[0] as Record<string, unknown> | undefined;
+  if (!t) return null;
+
+  const lines = batchRes[1].results as Record<string, unknown>[];
+  const pays = batchRes[2].results as Record<string, unknown>[];
+
+  const adj = {
+    order_discount_centavos: Number(t.order_discount_centavos ?? 0),
+    service_charge_centavos: Number(t.service_charge_centavos ?? 0),
+    tip_centavos: Number(t.tip_centavos ?? 0),
+  };
+
+  const linesForTotals = lines
+    .filter((l) => !l.voided)
+    .map((l) => ({
+      qty: Number(l.qty ?? 0),
+      unit_price_centavos: Number(l.unit_price_centavos ?? 0),
+      discount_centavos: l.discount_centavos !== null && l.discount_centavos !== undefined ? Number(l.discount_centavos) : 0,
+      rate_bps: l.rate_bps !== null && l.rate_bps !== undefined ? Number(l.rate_bps) : 0,
+    }));
+
+  const tTotals = computeTicketTotalsFromRows(adj, linesForTotals);
+  const paid = pays
+    .filter((p) => p.status === "completed")
+    .reduce((sum, p) => sum + Number(p.amount_centavos ?? 0), 0);
+
+  const totals = {
+    lineGrossCentavos: tTotals.lineGrossCentavos,
+    lineItemDiscountCentavos: tTotals.lineItemDiscountCentavos,
+    lineSubtotalCentavos: tTotals.lineSubtotalCentavos,
+    orderDiscountCentavos: tTotals.orderDiscountCentavos,
+    totalDiscountCentavos: tTotals.totalDiscountCentavos,
+    serviceChargeCentavos: tTotals.serviceChargeCentavos,
+    tipCentavos: tTotals.tipCentavos,
+    taxCentavos: tTotals.taxCentavos,
+    taxByRate: tTotals.taxByRate,
+    dueCentavos: tTotals.dueCentavos,
+    paidCompletedCentavos: paid,
+    remainingDueCentavos: Math.max(0, tTotals.dueCentavos - paid),
+  };
+
+  return { ticket: t, lineItems: lines, payments: pays, totals };
 }
 
 ticketRoutes.post("/", requireAuth(), async (c) => {
@@ -71,7 +132,7 @@ ticketRoutes.post("/", requireAuth(), async (c) => {
     orgId: auth.orgId,
     userId: auth.id,
     registerId: body.registerId,
-    action: "ticket.create",
+    action: "ticket.opened",
     entityType: "ticket",
     entityId: id,
     payload: body,
@@ -138,7 +199,8 @@ ticketRoutes.patch("/:id/adjustments", requireAuth(), async (c) => {
     .run();
 
   await writeAudit({ db: c.env.DB, orgId: auth.orgId, userId: auth.id, action: "ticket.adjustments", entityId: ticketId, payload: next });
-  return c.json({ ok: true, totals: await ticketTotalsPayload(c.env.DB, ticketId) });
+  const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
+  return c.json({ ok: true, ...payload });
 });
 
 ticketRoutes.patch("/:id/park", requireAuth(), async (c) => {
@@ -168,7 +230,8 @@ ticketRoutes.patch("/:id/type", requireAuth(), async (c) => {
     .bind(body.ticketType, now, ticketId, auth.orgId)
     .run();
   if (!res.success || res.meta.changes === 0) return c.json({ error: "not_found" }, 404);
-  return c.json({ ok: true });
+  const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
+  return c.json({ ok: true, ...payload });
 });
 
 const TicketMetaIn = z.object({
@@ -208,7 +271,8 @@ ticketRoutes.patch("/:id/meta", requireAuth(), async (c) => {
   const sql = `UPDATE tickets SET ${sets.join(", ")}, updated_at = ? WHERE id = ? AND org_id = ?`;
 
   await c.env.DB.prepare(sql).bind(...vals).run();
-  return c.json({ ok: true });
+  const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
+  return c.json({ ok: true, ...payload });
 });
 
 const VoidTicketIn = z.object({ reason: z.string().min(1).max(500) });
@@ -283,17 +347,20 @@ ticketRoutes.post("/:id/lines", requireAuth(), async (c) => {
   if (!product || product.is_active !== 1) return c.json({ error: "bad_product" }, 400);
   if (product.out_of_stock === 1) return c.json({ error: "out_of_stock" }, 400);
 
-  const modCheck = await validateModifierSelection({
+  const pricing = await resolveLineItemPricing({
     db: c.env.DB,
     orgId: auth.orgId,
     productId: body.productId,
-    basePriceCentavos: product.price_centavos,
-    selectedModifierIds: body.modifierIds ?? [],
+    catalogPriceCentavos: product.price_centavos,
+    qty: body.qty,
+    modifierIds: body.modifierIds ?? [],
+    extraDiscountCentavos: body.discountCentavos ?? 0,
   });
-  if (!modCheck.ok) return c.json({ error: modCheck.error }, 400);
+  if (!pricing.ok) return c.json({ error: pricing.error }, 400);
 
-  const modifiersJson = JSON.stringify(modCheck.modifiersSnapshot);
-  const unitPrice = modCheck.unitPriceCentavos;
+  const modifiersJson = JSON.stringify(pricing.modifiersSnapshot);
+  const unitPrice = pricing.unitPriceCentavos;
+  const lineDiscount = pricing.discountCentavos;
 
   const lineId = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -311,7 +378,7 @@ ticketRoutes.post("/:id/lines", requireAuth(), async (c) => {
       body.productId,
       body.qty,
       unitPrice,
-      body.discountCentavos ?? 0,
+      lineDiscount,
       body.lineNotes ?? null,
       body.course ?? 0,
       sort,
@@ -323,12 +390,14 @@ ticketRoutes.post("/:id/lines", requireAuth(), async (c) => {
   await c.env.DB.prepare(`UPDATE tickets SET updated_at = ? WHERE id = ?`).bind(now, ticketId).run();
   await c.env.DB.prepare(`UPDATE ticket_kds_meta SET updated_at = ? WHERE ticket_id = ?`).bind(now, ticketId).run();
 
-  return c.json({ lineItemId: lineId });
+  const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
+  return c.json({ lineItemId: lineId, ...payload });
 });
 
 const LinePatchIn = z.object({
   qty: z.number().int().positive().optional(),
   discountCentavos: z.number().int().nonnegative().optional(),
+  lineNotes: z.string().max(500).nullable().optional(),
 });
 
 ticketRoutes.patch("/:ticketId/lines/:lineId", requireAuth(), async (c) => {
@@ -343,11 +412,22 @@ ticketRoutes.patch("/:ticketId/lines/:lineId", requireAuth(), async (c) => {
   }>();
   if (!ticket || !["open", "parked"].includes(ticket.status)) return c.json({ error: "ticket_locked" }, 400);
 
-  const line = await c.env.DB.prepare(`SELECT id, voided FROM line_items WHERE id = ? AND ticket_id = ?`).bind(lineId, ticketId).first<{
+  const line = await c.env.DB
+    .prepare(`SELECT id, voided, qty, unit_price_centavos FROM line_items WHERE id = ? AND ticket_id = ?`)
+    .bind(lineId, ticketId)
+    .first<{
     id: string;
     voided: number;
+    qty: number;
+    unit_price_centavos: number;
   }>();
   if (!line || line.voided === 1) return c.json({ error: "not_found" }, 404);
+
+  const nextQty = body.qty ?? line.qty;
+  const lineGross = Math.max(0, line.unit_price_centavos * nextQty);
+  if (body.discountCentavos !== undefined && body.discountCentavos > lineGross) {
+    return c.json({ error: "discount_exceeds_line_total" }, 400);
+  }
 
   const sets: string[] = [];
   const vals: unknown[] = [];
@@ -359,12 +439,17 @@ ticketRoutes.patch("/:ticketId/lines/:lineId", requireAuth(), async (c) => {
     sets.push("discount_centavos = ?");
     vals.push(body.discountCentavos);
   }
+  if (body.lineNotes !== undefined) {
+    sets.push("line_notes = ?");
+    vals.push(body.lineNotes);
+  }
   if (!sets.length) return c.json({ error: "no_fields" }, 400);
   vals.push(lineId, ticketId);
   const now = new Date().toISOString();
   await c.env.DB.prepare(`UPDATE line_items SET ${sets.join(", ")} WHERE id = ? AND ticket_id = ?`).bind(...vals).run();
   await c.env.DB.prepare(`UPDATE tickets SET updated_at = ? WHERE id = ?`).bind(now, ticketId).run();
-  return c.json({ ok: true });
+  const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
+  return c.json({ ok: true, ...payload });
 });
 
 ticketRoutes.delete("/:ticketId/lines/:lineId", requireAuth(), async (c) => {
@@ -386,7 +471,8 @@ ticketRoutes.delete("/:ticketId/lines/:lineId", requireAuth(), async (c) => {
 
   const now = new Date().toISOString();
   await c.env.DB.prepare(`UPDATE tickets SET updated_at = ? WHERE id = ?`).bind(now, ticketId).run();
-  return c.json({ ok: true });
+  const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
+  return c.json({ ok: true, ...payload });
 });
 
 const VoidLine = z.object({ reason: z.string().min(1).max(500) });
@@ -422,7 +508,8 @@ ticketRoutes.post("/:ticketId/lines/:lineId/void", requireAuth(), async (c) => {
     entityId: lineId,
     payload: body,
   });
-  return c.json({ ok: true });
+  const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
+  return c.json({ ok: true, ...payload });
 });
 
 ticketRoutes.post("/:id/merge-from", requireAuth(), requireManager(), async (c) => {
@@ -492,14 +579,7 @@ ticketRoutes.post("/:id/merge-from", requireAuth(), requireManager(), async (c) 
 ticketRoutes.get("/:id", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
   const id = c.req.param("id");
-  const t = await c.env.DB.prepare(`SELECT * FROM tickets WHERE id = ? AND org_id = ?`).bind(id, auth.orgId).first<Record<string, unknown>>();
-  if (!t) return c.json({ error: "not_found" }, 404);
-  const lines = await c.env.DB.prepare(
-    `SELECT li.*, p.name as product_name FROM line_items li JOIN products p ON p.id = li.product_id WHERE li.ticket_id = ? ORDER BY li.sort_order`,
-  )
-    .bind(id)
-    .all<Record<string, unknown>>();
-  const pays = await c.env.DB.prepare(`SELECT * FROM payments WHERE ticket_id = ? ORDER BY created_at`).bind(id).all();
-  const totals = await ticketTotalsPayload(c.env.DB, id);
-  return c.json({ ticket: t, lineItems: lines.results ?? [], payments: pays.results ?? [], totals });
+  const payload = await getTicketDetailPayload(c.env.DB, id, auth.orgId);
+  if (!payload) return c.json({ error: "not_found" }, 404);
+  return c.json(payload);
 });

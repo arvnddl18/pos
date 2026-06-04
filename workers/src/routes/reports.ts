@@ -95,11 +95,18 @@ reportRoutes.get("/eod", requireAuth(), requireManager(), async (c) => {
   const lineRow = await c.env.DB.prepare(
     `SELECT
        COALESCE(SUM(li.unit_price_centavos * li.qty), 0) as gross_sales,
-       COALESCE(SUM(li.discount_centavos), 0) as total_discounts
+       COALESCE(SUM(CASE WHEN t.notes LIKE '%[MARKETING_FREEBIE]%' THEN 0 ELSE li.discount_centavos END), 0) as discount_only,
+       COALESCE(SUM(CASE WHEN t.notes LIKE '%[MARKETING_FREEBIE]%' THEN li.unit_price_centavos * li.qty ELSE 0 END), 0) as marketing_expense
      FROM line_items li
      JOIN tickets t ON t.id = li.ticket_id
      WHERE t.org_id = ? AND t.status = 'paid' AND li.voided = 0 ${dc}`,
-  ).bind(auth.orgId).first<{ gross_sales: number; total_discounts: number }>();
+  ).bind(auth.orgId).first<{ gross_sales: number; discount_only: number; marketing_expense: number }>();
+
+  const marketingCountRow = await c.env.DB.prepare(
+    `SELECT COUNT(*) as marketing_tickets
+     FROM tickets t
+     WHERE t.org_id = ? AND t.status = 'paid' AND t.notes LIKE '%[MARKETING_FREEBIE]%' ${dc}`,
+  ).bind(auth.orgId).first<{ marketing_tickets: number }>();
 
   const txRow = await c.env.DB.prepare(
     `SELECT
@@ -111,10 +118,13 @@ reportRoutes.get("/eod", requireAuth(), requireManager(), async (c) => {
   ).bind(auth.orgId).first<{ total_tickets: number; dine_in_count: number; takeout_count: number }>();
 
   const grossSales    = Number(lineRow?.gross_sales ?? 0);
-  const discounts     = Number(lineRow?.total_discounts ?? 0);
+  const discounts     = Number(lineRow?.discount_only ?? 0);
   const netSales      = grossSales - discounts;
   const refundAmt     = Number(refunds?.total ?? 0);
   const adjustedNet   = netSales - refundAmt;
+  const marketingExpense = Number(lineRow?.marketing_expense ?? 0);
+  const totalDiscounts = discounts + marketingExpense;
+  const adjustedAfterMarketing = adjustedNet - marketingExpense;
   const vatCollected  = Number(taxRow?.total ?? 0);
   const vatableSales  = vatCollected > 0 ? Math.round(adjustedNet / 1.12) : adjustedNet;
   const totalCollected = Number(cashRow?.total ?? 0) + Number(ewalletRow?.total ?? 0);
@@ -124,9 +134,14 @@ reportRoutes.get("/eod", requireAuth(), requireManager(), async (c) => {
     tenders: sales.results ?? [],
     grossSalesCentavos: grossSales,
     discountsCentavos: discounts,
+    discountOnlyCentavos: discounts,
+    totalDiscountsCentavos: totalDiscounts,
     netSalesCentavos: netSales,
     refundsCentavos: refundAmt,
     adjustedNetCentavos: adjustedNet,
+    marketingExpenseCentavos: marketingExpense,
+    adjustedAfterMarketingCentavos: adjustedAfterMarketing,
+    marketingTicketCount: Number(marketingCountRow?.marketing_tickets ?? 0),
     taxCollectedCentavos: vatCollected,
     vatableSalesCentavos: vatableSales,
     cashCentavos: cashRow?.total ?? 0,
@@ -156,7 +171,7 @@ reportRoutes.get("/bir", requireAuth(), requireManager(), async (c) => {
 
   // Use subqueries for aggregation to avoid Cartesian product duplication from multiple line items
   const tickets = await c.env.DB.prepare(
-    `SELECT t.id, t.ticket_type, t.created_at, t.tax_centavos_snapshot,
+    `SELECT t.id, t.ticket_type, t.created_at, t.tax_centavos_snapshot, t.notes,
        (SELECT COALESCE(SUM(li.unit_price_centavos * li.qty), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as gross_amount,
        (SELECT COALESCE(SUM(li.discount_centavos), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as discount_amount
      FROM tickets t
@@ -165,12 +180,16 @@ reportRoutes.get("/bir", requireAuth(), requireManager(), async (c) => {
   ).bind(auth.orgId).all();
 
   const rows = (tickets.results ?? []) as Record<string, number | string>[];
-  let totalGross = 0, totalDiscount = 0, totalTax = 0, totalNet = 0;
+  let totalGross = 0, totalDiscountOnly = 0, totalMarketingExpense = 0, totalTax = 0, totalNet = 0;
   
   const items = rows.map((r, idx) => {
     const gross   = Number(r.gross_amount ?? 0);
-    const disc    = Number(r.discount_amount ?? 0);
-    const net     = gross - disc;
+    const discRaw = Number(r.discount_amount ?? 0);
+    const isMarketingFreebie = String(r.notes ?? "").includes("[MARKETING_FREEBIE]");
+    const marketingExpense = isMarketingFreebie ? gross : 0;
+    const disc = isMarketingFreebie ? 0 : discRaw;
+    const totalDiscount = disc + marketingExpense;
+    const net     = gross - totalDiscount;
     const tax     = Number(r.tax_centavos_snapshot ?? 0);
     
     // In BIR reports, Net Sales = Vatable Sales + VAT
@@ -178,7 +197,8 @@ reportRoutes.get("/bir", requireAuth(), requireManager(), async (c) => {
     const vatAmt  = tax > 0 ? net - vatable : 0;
     
     totalGross   += gross;
-    totalDiscount+= disc;
+    totalDiscountOnly += disc;
+    totalMarketingExpense += marketingExpense;
     totalTax     += vatAmt;
     totalNet     += net;
     
@@ -189,7 +209,7 @@ reportRoutes.get("/bir", requireAuth(), requireManager(), async (c) => {
       date: new Date(String(r.created_at)).toLocaleDateString("en-PH"),
       type: String(r.ticket_type).replace("_", "-"),
       grossAmount: gross,
-      discount: disc,
+      discount: totalDiscount,
       netAmount: net,
       vatableSales: vatable,
       vatAmount: vatAmt,
@@ -203,7 +223,10 @@ reportRoutes.get("/bir", requireAuth(), requireManager(), async (c) => {
     summary: {
       totalTransactions: items.length,
       grossSalesCentavos: totalGross,
-      discountsCentavos: totalDiscount,
+      discountsCentavos: totalDiscountOnly,
+      discountOnlyCentavos: totalDiscountOnly,
+      marketingExpenseCentavos: totalMarketingExpense,
+      totalDiscountsCentavos: totalDiscountOnly + totalMarketingExpense,
       netSalesCentavos: totalNet,
       vatableSalesCentavos: totalTax > 0 ? Math.round(totalNet / 1.12) : totalNet,
       vatCollectedCentavos: totalTax,
@@ -272,7 +295,7 @@ reportRoutes.get("/bir.csv", requireAuth(), requireManager(), async (c) => {
   }
 
   const tickets = await c.env.DB.prepare(
-    `SELECT t.id, t.ticket_type, t.created_at, t.tax_centavos_snapshot,
+    `SELECT t.id, t.ticket_type, t.created_at, t.tax_centavos_snapshot, t.notes,
        (SELECT COALESCE(SUM(li.unit_price_centavos * li.qty), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as gross_amount,
        (SELECT COALESCE(SUM(li.discount_centavos), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as discount_amount
      FROM tickets t
@@ -284,8 +307,12 @@ reportRoutes.get("/bir.csv", requireAuth(), requireManager(), async (c) => {
   let idx = 1;
   const lines = (tickets.results as Record<string, number | string>[]).map((r) => {
     const gross  = Number(r.gross_amount ?? 0) / 100;
-    const disc   = Number(r.discount_amount ?? 0) / 100;
-    const net    = gross - disc;
+    const discRaw = Number(r.discount_amount ?? 0) / 100;
+    const isMarketingFreebie = String(r.notes ?? "").includes("[MARKETING_FREEBIE]");
+    const marketingExpense = isMarketingFreebie ? gross : 0;
+    const disc   = isMarketingFreebie ? 0 : discRaw;
+    const totalDiscount = disc + marketingExpense;
+    const net    = gross - totalDiscount;
     const tax    = Number(r.tax_centavos_snapshot ?? 0) / 100;
     const vatable= tax > 0 ? net / 1.12 : net;
     const vat    = tax > 0 ? net - vatable : 0;
@@ -296,7 +323,7 @@ reportRoutes.get("/bir.csv", requireAuth(), requireManager(), async (c) => {
       dt.toLocaleDateString("en-PH"),
       dt.toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit" }),
       String(r.ticket_type).replace("_", "-"),
-      gross.toFixed(2), disc.toFixed(2), net.toFixed(2),
+      gross.toFixed(2), totalDiscount.toFixed(2), net.toFixed(2),
       vatable.toFixed(2), vat.toFixed(2),
       net.toFixed(2), // TOTAL MUST BE NET
     ].join(",");

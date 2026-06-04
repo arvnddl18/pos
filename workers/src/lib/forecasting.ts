@@ -9,10 +9,21 @@ export interface ForecastResult {
   modelInsight: string;
 }
 
+export interface MarketInsight {
+  title: string;
+  content: string;
+  type: "trend" | "demographic" | "season" | "calendar";
+}
+
 export interface DailyForecast {
   date: string;
   totalForecastedUnits: number;
   byProduct: ForecastResult[];
+}
+
+export interface ForecastResponse {
+  forecasts: DailyForecast[];
+  insights: MarketInsight[];
 }
 
 interface HistoricalData {
@@ -112,27 +123,35 @@ export async function generateForecastWithAI(
   apiKey: string,
   model: string,
   historicalData: HistoricalData[]
-): Promise<DailyForecast[]> {
+): Promise<ForecastResponse> {
   if (!apiKey || !model) {
     throw new Error("OpenRouter API key or model not configured");
   }
 
   const historicalPrompt = formatHistoricalDataForPrompt(historicalData);
 
-  const prompt = `You are an AI sales forecasting expert for a coffee shop POS system. 
-Analyze the following historical sales data and provide demand forecasts for the next 7 days.
+  const prompt = `You are an AI sales forecasting and market analysis expert for a coffee shop POS system located in Davao City, Philippines.
+Analyze the following historical sales data and provide demand forecasts for the next 7 days, as well as actionable market insights.
 
 Historical Data (Last 30 days):
 ${historicalPrompt}
 
-Based on this data, provide a JSON response with forecasts for each product for the next 7 days.
-Consider:
-- Weekly patterns (coffee shops often have different sales on weekdays vs weekends)
-- Seasonal trends in the historical data
-- Average sales velocity
+Based on this data and your knowledge of the area, provide a JSON response with forecasts for each product for the next 7 days, along with a list of market insights.
+When generating market insights, consider:
+1. Davao City, Philippines local context (weather, lifestyle).
+2. The Philippines calendar (approaching holidays, paydays).
+3. Demographic insights (e.g. what Professionals, Students, Families, etc., want this season). Analyze all demographics relevant to a coffee shop.
+4. Current internet and social media trends in food and beverage.
 
 Respond with ONLY valid JSON in this exact format (no markdown, no extra text):
 {
+  "marketInsights": [
+    {
+      "title": "Short catchy title (e.g., 'Professional Rush', 'Summer Coolers')",
+      "content": "A concise, 1-2 sentence actionable insight.",
+      "type": "trend" // must be one of: "trend", "demographic", "season", "calendar"
+    }
+  ],
   "forecasts": [
     {
       "date": "YYYY-MM-DD",
@@ -169,7 +188,7 @@ Respond with ONLY valid JSON in this exact format (no markdown, no extra text):
         },
       ],
       temperature: 0.7,
-      max_tokens: 2000,
+      max_tokens: 8000,
     }),
   });
 
@@ -234,7 +253,19 @@ Respond with ONLY valid JSON in this exact format (no markdown, no extra text):
     });
   }
 
-  return dailyForecasts;
+  // Validate and parse market insights safely
+  const rawInsights = jsonResponse.marketInsights;
+  const marketInsights = Array.isArray(rawInsights)
+    ? rawInsights.map((insight: any) => ({
+        title: insight?.title || "Market Insight",
+        content: insight?.content || "",
+        type: ["trend", "demographic", "season", "calendar"].includes(insight?.type) 
+          ? insight.type 
+          : "trend",
+      })).filter((i: any) => i.content.length > 0)
+    : [];
+
+  return { forecasts: dailyForecasts, insights: marketInsights };
 }
 
 /**
@@ -242,7 +273,7 @@ Respond with ONLY valid JSON in this exact format (no markdown, no extra text):
  */
 export function generateStatisticalForecast(
   historicalData: HistoricalData[]
-): DailyForecast[] {
+): ForecastResponse {
   const forecastDays = 7;
   const forecasts: DailyForecast[] = [];
 
@@ -285,5 +316,28 @@ export function generateStatisticalForecast(
     });
   }
 
-  return forecasts;
+    const defaultInsights: MarketInsight[] = [
+      {
+        title: "Upcoming Holiday Promo",
+        content: "Consider offering a 10% discount on signature drinks this upcoming payday weekend to boost afternoon sales.",
+        type: "calendar"
+      },
+      {
+        title: "Professional Rush",
+        content: "Professionals in Davao City tend to purchase more espresso-based drinks in the morning. Target them with a breakfast pastry combo.",
+        type: "demographic"
+      },
+      {
+        title: "Rainy Season Comforts",
+        content: "Hot beverages typically see a 20% spike during the rainy season. Ensure sufficient stock of hot cups and emphasize hot lattes.",
+        type: "season"
+      },
+      {
+        title: "Matcha Social Trend",
+        content: "Matcha-based drinks are currently trending heavily on local social media. Highlight your Matcha Cloud on your digital menus.",
+        type: "trend"
+      }
+    ];
+
+    return { forecasts, insights: defaultInsights };
 }

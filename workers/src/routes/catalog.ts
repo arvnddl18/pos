@@ -4,6 +4,7 @@ import type { AppEnv } from "../ctx.js";
 import { requireAuth } from "../middleware/session.js";
 import { requireManager } from "../middleware/rbac.js";
 import { writeAudit } from "../audit.js";
+import { applyPriceRulesToProducts, loadActivePriceRules, resolveEffectivePrice } from "../lib/price_rules.js";
 
 export const catalogRoutes = new Hono<AppEnv>();
 
@@ -35,24 +36,27 @@ catalogRoutes.post("/categories", requireAuth(), requireManager(), async (c) => 
 
 catalogRoutes.get("/products", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
+  const priceRules = await loadActivePriceRules(c.env.DB, auth.orgId);
   const q = c.req.query("q")?.trim();
   if (q) {
     const like = `%${q}%`;
     const rows = await c.env.DB.prepare(
-      `SELECT p.id, p.name, p.sku, p.barcode, p.price_centavos, p.category_id, p.is_active, p.out_of_stock, p.is_retail, p.image_r2_key, p.names_i18n_json
+      `SELECT p.id, p.name, p.sku, p.barcode, p.price_centavos, p.category_id, p.tax_profile_id, p.is_active, p.out_of_stock, p.is_retail, p.image_r2_key, p.names_i18n_json
        FROM products p WHERE p.org_id = ? AND p.is_archived = 0 AND (p.name LIKE ? OR IFNULL(p.sku,'') LIKE ? OR IFNULL(p.barcode,'') LIKE ?) ORDER BY p.name LIMIT 200`,
     )
       .bind(auth.orgId, like, like, like)
-      .all<Record<string, unknown>>();
-    return c.json({ products: rows.results ?? [] });
+      .all<{ id: string; price_centavos: number } & Record<string, unknown>>();
+    const products = applyPriceRulesToProducts(rows.results ?? [], priceRules);
+    return c.json({ products });
   }
   const rows = await c.env.DB.prepare(
-    `SELECT p.id, p.name, p.sku, p.barcode, p.price_centavos, p.category_id, p.is_active, p.out_of_stock, p.is_retail, p.image_r2_key, p.names_i18n_json
+    `SELECT p.id, p.name, p.sku, p.barcode, p.price_centavos, p.category_id, p.tax_profile_id, p.is_active, p.out_of_stock, p.is_retail, p.image_r2_key, p.names_i18n_json
      FROM products p WHERE p.org_id = ? AND p.is_archived = 0 ORDER BY p.name LIMIT 500`,
   )
     .bind(auth.orgId)
-    .all<Record<string, unknown>>();
-  return c.json({ products: rows.results ?? [] });
+    .all<{ id: string; price_centavos: number } & Record<string, unknown>>();
+  const products = applyPriceRulesToProducts(rows.results ?? [], priceRules);
+  return c.json({ products });
 });
 
 catalogRoutes.get("/products/:productId/pos-detail", requireAuth(), async (c) => {
@@ -65,6 +69,14 @@ catalogRoutes.get("/products/:productId/pos-detail", requireAuth(), async (c) =>
     .bind(productId, auth.orgId)
     .first<Record<string, unknown>>();
   if (!p) return c.json({ error: "not_found" }, 404);
+  const priceRules = await loadActivePriceRules(c.env.DB, auth.orgId);
+  const basePrice = Number(p.price_centavos);
+  const { effectivePriceCentavos } = resolveEffectivePrice(basePrice, productId, priceRules);
+  const product = {
+    ...p,
+    regular_price_centavos: basePrice,
+    effective_price_centavos: effectivePriceCentavos,
+  };
   const groups = await c.env.DB.prepare(
     `SELECT mg.id, mg.name, mg.required, mg.min_select, mg.max_select, mg.exclusive, pmg.sort_order as link_sort
      FROM product_modifier_groups pmg
@@ -93,7 +105,7 @@ catalogRoutes.get("/products/:productId/pos-detail", requireAuth(), async (c) =>
     }
   }
 
-  return c.json({ product: p, modifierGroups: groups.results ?? [], modifiersByGroup });
+  return c.json({ product, modifierGroups: groups.results ?? [], modifiersByGroup });
 });
 
 catalogRoutes.patch("/categories/:id", requireAuth(), requireManager(), async (c) => {
@@ -403,6 +415,16 @@ catalogRoutes.post("/products/:productId/modifier-groups", requireAuth(), requir
     .run();
   return c.json({ ok: true });
 });
+
+catalogRoutes.delete("/products/:productId/modifier-groups", requireAuth(), requireManager(), async (c) => {
+  const auth = c.get("auth")!;
+  const productId = c.req.param("productId");
+  const p = await c.env.DB.prepare("SELECT id FROM products WHERE id = ? AND org_id = ? AND is_archived = 0").bind(productId, auth.orgId).first();
+  if (!p) return c.json({ error: "not_found" }, 404);
+  await c.env.DB.prepare("DELETE FROM product_modifier_groups WHERE product_id = ?").bind(productId).run();
+  return c.json({ ok: true });
+});
+
 
 catalogRoutes.get("/menus", requireAuth(), async (c) => {
   const auth = c.get("auth")!;

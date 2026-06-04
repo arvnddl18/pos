@@ -26,7 +26,7 @@ function GcashCustomerPanel({ ew }: { ew: EwalletUi }) {
       {ew.qr_r2_key ? (
         <img
           alt="GCash receive QR"
-          src={`${API_BASE}/uploads/asset?key=${encodeURIComponent(String(ew.qr_r2_key))}`}
+          src={resolveAssetImageSrc(String(ew.qr_r2_key))}
           style={{ maxWidth: 220, alignSelf: "start", borderRadius: 6 }}
         />
       ) : null}
@@ -44,11 +44,21 @@ type Product = {
   id: string;
   name: string;
   price_centavos: number;
+  regular_price_centavos?: number;
+  effective_price_centavos?: number;
   category_id?: string | null;
   image_r2_key?: string | null;
   out_of_stock?: number;
   is_active?: number;
 };
+
+function productSellPrice(p: Product): number {
+  return p.effective_price_centavos ?? p.price_centavos;
+}
+
+function productRegularPrice(p: Product): number {
+  return p.regular_price_centavos ?? p.price_centavos;
+}
 type Category = { id: string; name: string; sort_order: number };
 type LineItem = {
   id: string;
@@ -56,13 +66,18 @@ type LineItem = {
   qty: number;
   unit_price_centavos: number;
   discount_centavos?: number | null;
+  line_notes?: string | null;
   voided?: number;
   product_name?: string;
+  rate_bps?: number | null;
 };
 type PaymentRow = { id: string; tender_type: string; amount_centavos: number; status: string };
 type Totals = {
+  lineGrossCentavos: number;
+  lineItemDiscountCentavos: number;
   lineSubtotalCentavos: number;
   orderDiscountCentavos: number;
+  totalDiscountCentavos: number;
   serviceChargeCentavos: number;
   tipCentavos: number;
   taxCentavos?: number;
@@ -81,6 +96,14 @@ function isManager(role: string) {
   return role === "manager" || role === "owner";
 }
 
+function resolveAssetImageSrc(key: string) {
+  const trimmed = key.trim();
+  if (!trimmed) return "";
+  if (/^(https?:)?\/\//i.test(trimmed) || trimmed.startsWith("data:image/")) return trimmed;
+  if (trimmed.startsWith("/")) return trimmed;
+  return `${API_BASE}/uploads/asset?key=${encodeURIComponent(trimmed)}`;
+}
+
 export function PosPage() {
   const [registers, setRegisters] = useState<Register[]>([]);
   const [registerId, setRegisterId] = useState(() => sessionStorage.getItem("registerId") ?? "");
@@ -97,24 +120,98 @@ export function PosPage() {
   const [busy, setBusy] = useState(false);
   const [payOpen, setPayOpen] = useState(false);
   const [payTab, setPayTab] = useState<"cash" | "gcash">("cash");
+  const [cashReceiptModal, setCashReceiptModal] = useState(false);
+  const [cashReceiptDetail, setCashReceiptDetail] = useState<any | null>(null);
+  const [cashReceiptLoading, setCashReceiptLoading] = useState(false);
+  const [cashReceiptError, setCashReceiptError] = useState<string | null>(null);
   const [refundOpen, setRefundOpen] = useState(false);
   const [cashPesosInput, setCashPesosInput] = useState("");
-  const [selectedTipPct, setSelectedTipPct] = useState<number | null>(null);
   const [me, setMe] = useState<{ role: string } | null>(null);
   const [modifierFlow, setModifierFlow] = useState<{ product: Product; detail: PosDetail } | null>(null);
   const [selectedMods, setSelectedMods] = useState<Record<string, string[]>>({});
   const [ewalletUi, setEwalletUi] = useState<EwalletUi>(null);
   const [bootLoading, setBootLoading] = useState(true);
-  const [notice, setNotice] = useState<string | null>(null);
+  const setNotice = (_value: string | null) => {};
   const [error, setError] = useState<string | null>(null);
+  const [imageLoadErrors, setImageLoadErrors] = useState<Record<string, true>>({});
   const deferredSearch = useDeferredValue(search);
   const [activeCategoryId, setActiveCategoryId] = useState("all");
   const isAddingProductRef = useRef(false);
 
-  // New features state
   const [demographicColor, setDemographicColor] = useState<string | null>(null);
-  const [feedbackOpen, setFeedbackOpen] = useState(false);
-  const [ticketFeedback, setTicketFeedback] = useState<{ rating: number | null; notes: string }>({ rating: null, notes: "" });
+  const [demographicExpanded, setDemographicExpanded] = useState(true);
+  const posDetailCache = useRef<Record<string, PosDetail>>({});
+  const lastRequestSeq = useRef(0);
+
+  const calculateTotalsClientSide = useCallback((
+    currentLines: LineItem[],
+    currentTotals: Totals
+  ): Totals => {
+    const lineNets: { net: number; rateBps: number }[] = [];
+    let lineGross = 0;
+    let lineItemDiscount = 0;
+    for (const r of currentLines) {
+      const gross = r.unit_price_centavos * r.qty;
+      const disc = r.discount_centavos ?? 0;
+      lineGross += gross;
+      lineItemDiscount += disc;
+      const net = Math.max(0, gross - disc);
+      lineNets.push({ net, rateBps: r.rate_bps ?? 0 });
+    }
+
+    const lineNetSubtotal = lineNets.reduce((s, x) => s + x.net, 0);
+    const orderDiscount = Math.min(Math.max(0, currentTotals.orderDiscountCentavos), lineNetSubtotal);
+    
+    const n = lineNets.length;
+    const alloc = new Array(n).fill(0);
+    if (n > 0 && orderDiscount > 0) {
+      const total = lineNets.reduce((a, b) => a + b.net, 0);
+      if (total > 0) {
+        const od = Math.min(orderDiscount, total);
+        let remaining = od;
+        for (let i = 0; i < n - 1; i++) {
+          const share = Math.floor((od * (lineNets[i]?.net ?? 0)) / total);
+          alloc[i] = share;
+          remaining -= share;
+        }
+        alloc[n - 1] = remaining;
+      }
+    }
+
+    const byRateMap = new Map<number, number>();
+    for (let i = 0; i < lineNets.length; i++) {
+      const ln = lineNets[i]!;
+      const taxable = Math.max(0, ln.net - (alloc[i] ?? 0));
+      const tax = Math.round((taxable * ln.rateBps) / 10000);
+      byRateMap.set(ln.rateBps, (byRateMap.get(ln.rateBps) ?? 0) + tax);
+    }
+
+    const taxByRate = [...byRateMap.entries()]
+      .filter(([bps]) => bps > 0)
+      .map(([rateBps, taxCentavos]) => ({ rateBps, taxCentavos }));
+
+    const taxCentavos = [...byRateMap.values()].reduce((a, b) => a + b, 0);
+
+    const dueCentavos = Math.max(
+      0,
+      lineNetSubtotal - orderDiscount + taxCentavos + currentTotals.serviceChargeCentavos + currentTotals.tipCentavos,
+    );
+
+    return {
+      lineGrossCentavos: lineGross,
+      lineItemDiscountCentavos: lineItemDiscount,
+      lineSubtotalCentavos: lineNetSubtotal,
+      orderDiscountCentavos: orderDiscount,
+      totalDiscountCentavos: lineItemDiscount + orderDiscount,
+      serviceChargeCentavos: currentTotals.serviceChargeCentavos,
+      tipCentavos: currentTotals.tipCentavos,
+      taxCentavos,
+      taxByRate,
+      dueCentavos,
+      paidCompletedCentavos: currentTotals.paidCompletedCentavos,
+      remainingDueCentavos: Math.max(0, dueCentavos - currentTotals.paidCompletedCentavos),
+    };
+  }, []);
 
   function publishKdsUpdate(reason: string) {
     if (typeof window === "undefined") return;
@@ -131,13 +228,12 @@ export function PosPage() {
     return id ? id.slice(0, 8) : "—";
   }
 
-  const refreshTicket = useCallback(async (id: string) => {
-    const res = await api<{
-      lineItems: LineItem[];
-      payments: PaymentRow[];
-      ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null; customer_id?: string | null; feedback_rating?: number | null; feedback_notes?: string | null };
-      totals: Totals;
-    }>(`/tickets/${id}`);
+  const updateTicketState = useCallback((res: {
+    lineItems: LineItem[];
+    payments: PaymentRow[];
+    ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null; customer_id?: string | null; feedback_rating?: number | null; feedback_notes?: string | null };
+    totals: Totals;
+  }) => {
     setLines((res.lineItems ?? []).filter((l) => !l.voided));
     setPayments(res.payments ?? []);
     setTicketStatus(res.ticket.status);
@@ -145,7 +241,6 @@ export function PosPage() {
     setTicketNumber(Number(res.ticket.ticket_no ?? 0) || null);
     setTotals(res.totals ?? null);
     setDemographicColor(res.ticket.demographic_color ?? null);
-    setTicketFeedback({ rating: res.ticket.feedback_rating ?? null, notes: res.ticket.feedback_notes ?? "" });
     if (res.ticket.status === "paid") {
       setTicketId(null);
       setTicketNumber(null);
@@ -155,9 +250,26 @@ export function PosPage() {
       setTicketStatus("");
       setTotals(null);
       setDemographicColor(null);
-      setTicketFeedback({ rating: null, notes: "" });
     }
   }, []);
+
+  const refreshTicket = useCallback(async (id: string) => {
+    const res = await api<{
+      lineItems: LineItem[];
+      payments: PaymentRow[];
+      ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null; customer_id?: string | null; feedback_rating?: number | null; feedback_notes?: string | null };
+      totals: Totals;
+    }>(`/tickets/${id}`);
+    updateTicketState(res);
+  }, [updateTicketState]);
+
+  useEffect(() => {
+    if (!ticketId) {
+      setDemographicExpanded(true);
+      return;
+    }
+    if (demographicColor) setDemographicExpanded(false);
+  }, [ticketId, demographicColor]);
 
   useEffect(() => {
     let mounted = true;
@@ -182,10 +294,42 @@ export function PosPage() {
       setBootLoading(false);
     }
     void bootstrap();
+    const refreshProducts = () => {
+      void api<{ products: Product[] }>("/catalog/products")
+        .then((res) => {
+          if (mounted) setProducts((res.products ?? []).filter((p) => p.is_active !== 0));
+        })
+        .catch(() => {});
+    };
+    const intervalId = window.setInterval(refreshProducts, 60_000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refreshProducts();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       mounted = false;
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);
+
+  // Preload all product images into browser cache so filter switching is instant
+  useEffect(() => {
+    if (products.length === 0) return;
+    const preloaded: HTMLImageElement[] = [];
+    for (const p of products) {
+      const key = p.image_r2_key ? String(p.image_r2_key) : "";
+      const src = resolveAssetImageSrc(key);
+      if (!src) continue;
+      const img = new Image();
+      img.src = src;
+      preloaded.push(img);
+    }
+    // Keep references alive until cleanup to avoid GC cancelling fetches
+    return () => {
+      preloaded.length = 0;
+    };
+  }, [products]);
 
   useEffect(() => {
     if (!payOpen) return;
@@ -196,7 +340,7 @@ export function PosPage() {
 
   useEffect(() => {
     if (!payOpen || !totals) return;
-    setCashPesosInput((totals.remainingDueCentavos / 100).toFixed(2));
+    setCashPesosInput("");
   }, [payOpen, totals]);
 
   useEffect(() => {
@@ -243,18 +387,80 @@ export function PosPage() {
   async function chooseTicketType(ticketType: "takeout" | "dine_in") {
     setSelectedTicketType(ticketType);
     if (!ticketId) return;
-    await api(`/tickets/${ticketId}/type`, { method: "PATCH", json: { ticketType } });
-    await refreshTicket(ticketId);
+    const seq = ++lastRequestSeq.current;
+    try {
+      const res = await api<any>(`/tickets/${ticketId}/type`, { method: "PATCH", json: { ticketType } });
+      if (seq === lastRequestSeq.current) {
+        updateTicketState(res);
+      }
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        refreshTicket(ticketId);
+        setError("Failed to update ticket type.");
+      }
+    }
   }
 
   async function addLine(productId: string, qty: number, modifierIds: string[], discountCentavos?: number) {
-    const tid = await ensureTicket();
-    await api(`/tickets/${tid}/lines`, {
-      method: "POST",
-      json: { productId, qty, modifierIds, discountCentavos: discountCentavos ?? 0 },
-    });
-    await refreshTicket(tid);
-    publishKdsUpdate("line_added");
+    const p = products.find(prod => prod.id === productId);
+    const tempId = `temp-${crypto.randomUUID()}`;
+    const regularUnit = p ? productRegularPrice(p) : 0;
+    const sellUnit = p ? productSellPrice(p) : 0;
+    const happyHourDisc = p ? Math.max(0, regularUnit - sellUnit) * qty : 0;
+    const tempLine: LineItem = {
+      id: tempId,
+      product_id: productId,
+      qty,
+      unit_price_centavos: regularUnit,
+      discount_centavos: (discountCentavos ?? 0) + happyHourDisc,
+      line_notes: null,
+      voided: 0,
+      product_name: p ? p.name : "Item",
+      rate_bps: 0
+    };
+
+    const nextLines = [...lines, tempLine];
+    setLines(nextLines);
+
+    const baseTotals = totals ?? {
+      lineGrossCentavos: 0,
+      lineItemDiscountCentavos: 0,
+      lineSubtotalCentavos: 0,
+      orderDiscountCentavos: 0,
+      totalDiscountCentavos: 0,
+      serviceChargeCentavos: 0,
+      tipCentavos: 0,
+      taxCentavos: 0,
+      taxByRate: [],
+      dueCentavos: 0,
+      paidCompletedCentavos: 0,
+      remainingDueCentavos: 0,
+    };
+    const nextTotals = calculateTotalsClientSide(nextLines, baseTotals);
+    setTotals(nextTotals);
+
+    const seq = ++lastRequestSeq.current;
+    try {
+      const tid = await ensureTicket();
+      const res = await api<any>(`/tickets/${tid}/lines`, {
+        method: "POST",
+        json: { productId, qty, modifierIds, discountCentavos: discountCentavos ?? 0 },
+      });
+      if (seq === lastRequestSeq.current) {
+        updateTicketState(res);
+      }
+      publishKdsUpdate("line_added");
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        if (ticketId) {
+          refreshTicket(ticketId);
+        } else {
+          setLines([]);
+          setTotals(null);
+        }
+        setError("Failed to add product to ticket.");
+      }
+    }
   }
 
   async function onPickProduct(p: Product) {
@@ -269,10 +475,17 @@ export function PosPage() {
     setBusy(true);
     try {
       let detail: PosDetail | null = null;
-      try {
-        detail = await api<PosDetail>(`/catalog/products/${p.id}/pos-detail`);
-      } catch {
-        detail = null;
+      if (posDetailCache.current[p.id]) {
+        detail = posDetailCache.current[p.id];
+      } else {
+        try {
+          detail = await api<PosDetail>(`/catalog/products/${p.id}/pos-detail`);
+          if (detail) {
+            posDetailCache.current[p.id] = detail;
+          }
+        } catch {
+          detail = null;
+        }
       }
 
       const groups = detail?.modifierGroups ?? [];
@@ -388,35 +601,58 @@ export function PosPage() {
     setPayments([]);
     setTicketStatus("");
     setTotals(null);
-    setSelectedTipPct(null);
     setNotice("Ready for new ticket");
-  }
-
-  async function applyTipPercent(pct: number) {
-    if (!ticketId || !totals) return;
-    const isToggleOff = selectedTipPct === pct;
-    const tip = isToggleOff ? 0 : Math.round(totals.lineSubtotalCentavos * (pct / 100));
-    await api(`/tickets/${ticketId}/adjustments`, { method: "PATCH", json: { tipCentavos: tip } });
-    await refreshTicket(ticketId); 
-    setSelectedTipPct(isToggleOff ? null : pct);
   }
 
   async function payCash(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (!ticketId) return;
+    if (!ticketId || !totals) return;
+    const paidTicketId = ticketId;
     const fd = new FormData(e.currentTarget);
     const pesos = Number(cashPesosInput || "0");
     const rounding = Number(String(fd.get("roundingCentavos") ?? "0")) || 0;
     const centavos = Math.round(pesos * 100);
+    if (centavos < totals.remainingDueCentavos) {
+      setError(`Insufficient cash. Need at least ${formatPhp(totals.remainingDueCentavos)} to complete this payment.`);
+      return;
+    }
     const key = crypto.randomUUID();
-    await api(`/tickets/${ticketId}/payments`, {
-      method: "POST",
-      headers: { "Idempotency-Key": key },
-      json: { tenderType: "cash", amountCentavos: centavos, roundingCentavos: rounding },
-    });
-    await refreshTicket(ticketId);
-    setPayOpen(false);
-    setNotice("Cash payment recorded");
+    const seq = ++lastRequestSeq.current;
+    try {
+      const res = await api<any>(`/tickets/${ticketId}/payments`, {
+        method: "POST",
+        headers: { "Idempotency-Key": key },
+        json: { tenderType: "cash", amountCentavos: centavos, roundingCentavos: rounding },
+      });
+      if (seq === lastRequestSeq.current) {
+        updateTicketState(res);
+        setPayOpen(false);
+        void openCashReceiptDetail(paidTicketId);
+        setNotice("Cash payment recorded");
+      }
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        refreshTicket(ticketId);
+        setError("Failed to record cash payment.");
+      }
+    }
+  }
+  async function openCashReceiptDetail(ticketIdToOpen: string) {
+    setCashReceiptModal(true);
+    setCashReceiptLoading(true);
+    setCashReceiptError(null);
+    setCashReceiptDetail(null);
+    try {
+      const detail = await api<{
+        ticket: { id: string; ticket_no?: number | null; created_at?: string | null };
+        textReceipt: string;
+      }>(`/tickets/${ticketIdToOpen}/receipt`);
+      setCashReceiptDetail(detail);
+    } catch (err: any) {
+      setCashReceiptError(err?.message ?? "Failed to load ticket receipt");
+    } finally {
+      setCashReceiptLoading(false);
+    }
   }
 
   async function payGcashStart(e: FormEvent<HTMLFormElement>) {
@@ -428,50 +664,172 @@ export function PosPage() {
     const rounding = Number(String(fd.get("roundingCentavos") ?? "0")) || 0;
     const centavos = Math.round(pesos * 100);
     const key = crypto.randomUUID();
-    await api(`/tickets/${ticketId}/payments`, {
-      method: "POST",
-      headers: { "Idempotency-Key": key },
-      json: {
-        tenderType: "e_wallet_personal",
-        amountCentavos: centavos,
-        referenceNote: ref || undefined,
-        roundingCentavos: rounding,
-      },
-    });
-    await refreshTicket(ticketId);
-    setNotice("GCash pending payment started");
+    const seq = ++lastRequestSeq.current;
+    try {
+      const res = await api<any>(`/tickets/${ticketId}/payments`, {
+        method: "POST",
+        headers: { "Idempotency-Key": key },
+        json: {
+          tenderType: "e_wallet_personal",
+          amountCentavos: centavos,
+          referenceNote: ref || undefined,
+          roundingCentavos: rounding,
+        },
+      });
+      if (seq === lastRequestSeq.current) {
+        updateTicketState(res);
+        setNotice("GCash pending payment started");
+      }
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        refreshTicket(ticketId);
+        setError("Failed to start GCash payment.");
+      }
+    }
   }
 
   async function confirmPayment(pid: string) {
-    await api(`/payments/${pid}/confirm-ewallet`, { method: "POST", json: {} });
-    if (ticketId) await refreshTicket(ticketId);
-    setPayOpen(false);
-    setNotice("GCash payment confirmed");
+    const seq = ++lastRequestSeq.current;
+    try {
+      const res = await api<any>(`/payments/${pid}/confirm-ewallet`, { method: "POST", json: {} });
+      if (seq === lastRequestSeq.current) {
+        updateTicketState(res);
+        setPayOpen(false);
+        setNotice("GCash payment confirmed");
+      }
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        if (ticketId) refreshTicket(ticketId);
+        setError("Failed to confirm GCash payment.");
+      }
+    }
+  }
+
+  async function closeMarketingFreebieTicket() {
+    if (!ticketId || !totals) return;
+    if (totals.remainingDueCentavos > 0) {
+      setError("Ticket still has remaining due. Complete payment first.");
+      return;
+    }
+    const influencerName = (window.prompt("Influencer name (optional):") ?? "").trim();
+    const campaign = (window.prompt("Campaign name (optional):") ?? "").trim();
+    const note = (window.prompt("Marketing note (optional):") ?? "").trim();
+    const seq = ++lastRequestSeq.current;
+    try {
+      const res = await api<any>(`/tickets/${ticketId}/close-freebie`, {
+        method: "POST",
+        json: {
+          influencerName: influencerName || undefined,
+          campaign: campaign || undefined,
+          note: note || undefined,
+        },
+      });
+      if (seq === lastRequestSeq.current) {
+        updateTicketState(res);
+        setPayOpen(false);
+        void openCashReceiptDetail(ticketId);
+        setNotice("Ticket submitted as marketing freebie");
+      }
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        refreshTicket(ticketId);
+        setError("Failed to submit freebie ticket.");
+      }
+    }
   }
 
   async function voidLine(li: LineItem) {
     const reason = window.prompt("Void reason (manager only)?");
     if (!reason) return;
     if (!ticketId) return;
-    await api(`/tickets/${ticketId}/lines/${li.id}/void`, { method: "POST", json: { reason } });
-    await refreshTicket(ticketId);
-    setNotice("Line voided");
+    const seq = ++lastRequestSeq.current;
+    try {
+      const res = await api<any>(`/tickets/${ticketId}/lines/${li.id}/void`, { method: "POST", json: { reason } });
+      if (seq === lastRequestSeq.current) {
+        updateTicketState(res);
+        setNotice("Line voided");
+      }
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        refreshTicket(ticketId);
+        setError("Failed to void line.");
+      }
+    }
   }
 
   async function updateLineQty(lineItem: LineItem, nextQty: number) {
     if (!ticketId) return;
-    if (nextQty <= 0) {
-      await api(`/tickets/${ticketId}/lines/${lineItem.id}`, { method: "DELETE", json: {} });
-      await refreshTicket(ticketId);
-      setNotice(`${lineItem.product_name ?? "Item"} removed`);
-      return;
+
+    // 1. Optimistic Update
+    const nextLines = lines
+      .map(li => li.id === lineItem.id ? { ...li, qty: nextQty } : li)
+      .filter(li => li.qty > 0 && !li.voided);
+    
+    setLines(nextLines);
+    if (totals) {
+      const nextTotals = calculateTotalsClientSide(nextLines, totals);
+      setTotals(nextTotals);
     }
-    await api(`/tickets/${ticketId}/lines/${lineItem.id}`, {
-      method: "PATCH",
-      json: { qty: nextQty },
-    });
-    await refreshTicket(ticketId);
-    setNotice(`${lineItem.product_name ?? "Item"} updated`);
+
+    const seq = ++lastRequestSeq.current;
+    try {
+      if (nextQty <= 0) {
+        const res = await api<any>(`/tickets/${ticketId}/lines/${lineItem.id}`, { method: "DELETE", json: {} });
+        if (seq === lastRequestSeq.current) {
+          updateTicketState(res);
+          setNotice(`${lineItem.product_name ?? "Item"} removed`);
+        }
+      } else {
+        const res = await api<any>(`/tickets/${ticketId}/lines/${lineItem.id}`, {
+          method: "PATCH",
+          json: { qty: nextQty },
+        });
+        if (seq === lastRequestSeq.current) {
+          updateTicketState(res);
+          setNotice(`${lineItem.product_name ?? "Item"} updated`);
+        }
+      }
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        refreshTicket(ticketId);
+        setError("Failed to update quantity. Reverting changes.");
+      }
+    }
+  }
+
+  async function setLineFreebie(lineItem: LineItem, nextFreebie: boolean) {
+    if (!ticketId) return;
+    const fullLinePrice = Math.max(0, lineItem.unit_price_centavos * lineItem.qty);
+    if (fullLinePrice <= 0) return;
+
+    const currentNotes = String(lineItem.line_notes ?? "").trim();
+    const strippedNotes = currentNotes.startsWith("[FREEBIE] ") ? currentNotes.replace("[FREEBIE] ", "").trim() : currentNotes;
+    let lineNotes = strippedNotes || undefined;
+    let discountCentavos = 0;
+
+    if (nextFreebie) {
+      const reasonInput = window.prompt("Freebie reason (optional):", strippedNotes) ?? "";
+      const reason = reasonInput.trim();
+      lineNotes = reason ? `[FREEBIE] ${reason}` : "[FREEBIE]";
+      discountCentavos = fullLinePrice;
+    }
+
+    const seq = ++lastRequestSeq.current;
+    try {
+      const res = await api<any>(`/tickets/${ticketId}/lines/${lineItem.id}`, {
+        method: "PATCH",
+        json: { discountCentavos, lineNotes },
+      });
+      if (seq === lastRequestSeq.current) {
+        updateTicketState(res);
+        setNotice(nextFreebie ? `${lineItem.product_name ?? "Item"} marked as freebie` : `${lineItem.product_name ?? "Item"} freebie removed`);
+      }
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        refreshTicket(ticketId);
+        setError("Failed to update freebie status.");
+      }
+    }
   }
 
   async function voidWholeTicket() {
@@ -487,38 +845,50 @@ export function PosPage() {
     e.preventDefault();
     if (!ticketId) return;
     const fd = new FormData(e.currentTarget);
-    await api(`/tickets/${ticketId}/refunds`, {
-      method: "POST",
-      json: {
-        amountCentavos: Math.round(Number(fd.get("pesos") ?? "0") * 100),
-        reason: String(fd.get("reason") ?? ""),
-        note: String(fd.get("note") ?? "") || undefined,
-      },
-    });
-    setRefundOpen(false);
-    await refreshTicket(ticketId);
-    setNotice("Refund recorded");
+    const seq = ++lastRequestSeq.current;
+    try {
+      const res = await api<any>(`/tickets/${ticketId}/refunds`, {
+        method: "POST",
+        json: {
+          amountCentavos: Math.round(Number(fd.get("pesos") ?? "0") * 100),
+          reason: String(fd.get("reason") ?? ""),
+          note: String(fd.get("note") ?? "") || undefined,
+        },
+      });
+      if (seq === lastRequestSeq.current) {
+        setRefundOpen(false);
+        updateTicketState(res);
+        setNotice("Refund recorded");
+      }
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        refreshTicket(ticketId);
+        setError("Failed to record refund.");
+      }
+    }
   }
 
   const pending = payments.filter((p) => p.status === "pending_ewallet");
   const paidCompleted = payments.filter((p) => p.status === "completed");
   const cashTenderedCentavos = Math.round((Number(cashPesosInput || "0") || 0) * 100);
   const cashDeltaCentavos = totals ? cashTenderedCentavos - totals.remainingDueCentavos : 0;
+  const canPaySplit = Boolean(ticketId && totals && selectedTicketType && demographicColor);
 
-  async function updateTicketMeta(meta: { demographicColor?: string; feedbackRating?: number; feedbackNotes?: string; customerId?: string }) {
+  async function updateTicketMeta(meta: { demographicColor?: string; customerId?: string }) {
     if (!ticketId) return;
-    await api(`/tickets/${ticketId}/meta`, { method: "PATCH", json: meta });
-    await refreshTicket(ticketId);
-    setNotice("Ticket metadata updated");
-  }
-
-  async function submitFeedback(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    const fd = new FormData(e.currentTarget);
-    const rating = Number(fd.get("rating") ?? "0");
-    const notes = String(fd.get("notes") ?? "");
-    await updateTicketMeta({ feedbackRating: rating, feedbackNotes: notes });
-    setFeedbackOpen(false);
+    const seq = ++lastRequestSeq.current;
+    try {
+      const res = await api<any>(`/tickets/${ticketId}/meta`, { method: "PATCH", json: meta });
+      if (seq === lastRequestSeq.current) {
+        updateTicketState(res);
+        setNotice("Ticket metadata updated");
+      }
+    } catch (err) {
+      if (seq === lastRequestSeq.current) {
+        refreshTicket(ticketId);
+        setError("Failed to update ticket metadata.");
+      }
+    }
   }
 
   const canVoid = me && isManager(me.role);
@@ -527,7 +897,6 @@ export function PosPage() {
     <div className="pos-page stack" style={{ gap: 16 }}>
       {bootLoading ? <div className="card muted">Loading POS data…</div> : null}
       {error ? <div className="error">{error}</div> : null}
-      {notice ? <div className="muted">{notice}</div> : null}
       <div className="pos-topbar">
         <div className="filter-icon-wrap pos-search">
           <span className="filter-icon">⌕</span>
@@ -544,25 +913,16 @@ export function PosPage() {
             ))}
           </select>
         </div>
-        <div className="row" style={{ flexWrap: "wrap" }}>
-          <button type="button" className="ghost-btn" onClick={() => newTicket()} disabled={!ticketId}>
-            <span className="btn-icon">＋</span>
-            <span>New ticket</span>
+        <div className="row pos-action-bar">
+          <button type="button" className="ghost-btn pos-icon-btn" onClick={() => newTicket()} disabled={!ticketId} title="New ticket" aria-label="New ticket">
+            <span aria-hidden="true">＋</span>
           </button>
-          <button type="button" className="ghost-btn" onClick={() => void parkTicket()} disabled={!ticketId}>
-            <span className="btn-icon">⏸</span>
-            <span>Park / hold</span>
+          <button type="button" className="ghost-btn pos-icon-btn" onClick={() => void parkTicket()} disabled={!ticketId} title="Park / hold" aria-label="Park / hold">
+            <span aria-hidden="true">⏸</span>
           </button>
-          {ticketId ? (
-            <a className="ghost-btn" href={`/receipt/${ticketId}`} target="_blank" rel="noreferrer">
-              <span className="btn-icon">🖨</span>
-              <span>Print receipt</span>
-            </a>
-          ) : null}
           {ticketId && canVoid ? (
-            <button type="button" className="ghost-btn" onClick={() => setRefundOpen(true)} disabled={!ticketId}>
-              <span className="btn-icon">↩</span>
-              <span>Refund…</span>
+            <button type="button" className="ghost-btn pos-icon-btn" onClick={() => setRefundOpen(true)} disabled={!ticketId} title="Refund" aria-label="Refund">
+              <span aria-hidden="true">↩</span>
             </button>
           ) : null}
         </div>
@@ -581,32 +941,51 @@ export function PosPage() {
       </div>
 
       <div className="panel-split">
-        <div className="stack" style={{ gap: 12 }}>
-          <div className="grid-products">
-            {filtered.map((p) => {
-              const categoryName = categories.find(c => c.id === p.category_id)?.name || "Uncategorized";
-              return (
-              <button key={p.id} type="button" className={`tile product-tile ${p.out_of_stock === 1 ? 'out-of-stock' : ''}`} disabled={busy || p.out_of_stock === 1} onClick={() => void onPickProduct(p)}>
-                <div className="product-image-container">
-                  {p.image_r2_key ? (
-                    <img
-                      className="product-image"
-                      src={`${API_BASE}/uploads/asset?key=${encodeURIComponent(String(p.image_r2_key))}`}
-                      alt={p.name}
-                      loading="lazy"
-                    />
-                  ) : (
-                    <div className="product-image" />
-                  )}
-                  {p.out_of_stock === 1 && <div className="out-of-stock-badge">Out of Stock</div>}
-                </div>
-                <div className="product-info">
-                  <div className="product-category">{categoryName}</div>
-                  <div className="product-name">{p.name}</div>
-                  <div className="price">{formatPhp(p.price_centavos)}</div>
-                </div>
-              </button>
-            )})}
+        <div className="stack pos-products-pane" style={{ gap: 12 }}>
+          <div className="pos-products-scroll">
+            <div className="grid-products">
+              {filtered.map((p) => {
+                const categoryName = categories.find(c => c.id === p.category_id)?.name || "Uncategorized";
+                const imageKey = p.image_r2_key ? String(p.image_r2_key) : "";
+                const imageSrc = resolveAssetImageSrc(imageKey);
+                const imageLoadFailed = Boolean(imageSrc && imageLoadErrors[imageSrc]);
+                return (
+                <button key={p.id} type="button" className={`tile product-tile ${p.out_of_stock === 1 ? 'out-of-stock' : ''}`} disabled={busy || p.out_of_stock === 1} onClick={() => void onPickProduct(p)}>
+                  <div className="product-image-container">
+                    {imageSrc && !imageLoadFailed ? (
+                      <img
+                        className="product-image"
+                        src={imageSrc}
+                        alt={p.name}
+                        loading="lazy"
+                        onError={() =>
+                          setImageLoadErrors((prev) =>
+                            prev[imageSrc] ? prev : { ...prev, [imageSrc]: true },
+                          )
+                        }
+                      />
+                    ) : (
+                      <div className="product-image product-image-fallback" aria-hidden="true" />
+                    )}
+                    {p.out_of_stock === 1 && <div className="out-of-stock-badge">Out of Stock</div>}
+                  </div>
+                  <div className="product-info">
+                    <div className="product-category">{categoryName}</div>
+                    <div className="product-name">{p.name}</div>
+                    <div className="price">
+                      {productSellPrice(p) < productRegularPrice(p) ? (
+                        <>
+                          <span className="price-regular">{formatPhp(productRegularPrice(p))}</span>{" "}
+                          <span className="price-sale">{formatPhp(productSellPrice(p))}</span>
+                        </>
+                      ) : (
+                        formatPhp(productSellPrice(p))
+                      )}
+                    </div>
+                  </div>
+                </button>
+              )})}
+            </div>
           </div>
         </div>
 
@@ -616,128 +995,208 @@ export function PosPage() {
             <span className="muted">{formatTicketLabel(ticketId, ticketNumber)}</span>
           </div>
           <div className="muted">Status: {ticketStatus || "—"}</div>
-          <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
-            <button
-              type="button"
-              className={selectedTicketType === "takeout" ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
-              onClick={() => void chooseTicketType("takeout")}
-            >
-              Takeout
-            </button>
-            <button
-              type="button"
-              className={selectedTicketType === "dine_in" ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
-              onClick={() => void chooseTicketType("dine_in")}
-            >
-              Dine-in
-            </button>
-          </div>
-
-          {ticketId ? (
-            <div className="stack" style={{ gap: 4, background: "var(--bg-elevated)", padding: 8, borderRadius: 6 }}>
-              <div className="stack" style={{ gap: 10 }}>
-                <span className="muted" style={{ fontSize: 13 }}>Demographic</span>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
-                  {[
-                    { value: "blue", label: "Student", bg: "#3b82f6" },
-                    { value: "green", label: "Pro", bg: "#22c55e" },
-                    { value: "red", label: "Family", bg: "#ef4444" },
-                    { value: "yellow", label: "Senior", bg: "#eab308" },
-                    { value: "purple", label: "Tourist", bg: "#a855f7" },
-                    { value: "orange", label: "Couple", bg: "#f97316" },
-                    { value: "pink", label: "Teen", bg: "#ec4899" },
-                    { value: "brown", label: "Group", bg: "#8b4513" },
-                  ].map((c) => (
-                    <button
-                      key={c.value}
-                      type="button"
-                      onClick={() => void updateTicketMeta({ demographicColor: demographicColor === c.value ? "" : c.value })}
-                      style={{
-                        display: "flex",
-                        flexDirection: "column",
-                        alignItems: "center",
-                        gap: 6,
-                        padding: "10px 4px",
-                        borderRadius: 12,
-                        background: demographicColor === c.value ? `${c.bg}15` : "#fff",
-                        border: `1px solid ${demographicColor === c.value ? c.bg : "var(--border)"}`,
-                        cursor: "pointer",
-                        transition: "all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1)",
-                        boxShadow: demographicColor === c.value ? `0 4px 12px ${c.bg}30` : "0 2px 4px rgba(0,0,0,0.02)",
-                        transform: demographicColor === c.value ? "translateY(-2px)" : "none"
-                      }}
-                    >
-                      <div style={{
-                        width: 28,
-                        height: 28,
-                        borderRadius: "50%",
-                        background: c.bg,
-                        boxShadow: "inset 0 2px 4px rgba(255,255,255,0.4), 0 2px 5px rgba(0,0,0,0.1)",
-                        border: demographicColor === c.value ? "2px solid #fff" : "2px solid transparent",
-                        outline: demographicColor === c.value ? `2px solid ${c.bg}` : "none",
-                      }} />
-                      <span style={{
-                        fontSize: 10,
-                        fontWeight: 700,
-                        color: demographicColor === c.value ? c.bg : "var(--muted)",
-                        textTransform: "uppercase",
-                        letterSpacing: "0.02em"
-                      }}>
-                        {c.label}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-                <span className="muted" style={{ fontSize: 13 }}>Feedback</span>
-                <button type="button" className="ghost-btn tiny-btn" onClick={() => setFeedbackOpen(true)}>
-                  {ticketFeedback.rating ? `★ ${ticketFeedback.rating}/5` : "Add"}
-                </button>
-              </div>
-            </div>
-          ) : null}
 
           <div className="cart-lines">
-            {lines.map((li) => (
+            {lines.map((li) => {
+            const lineSubtotalCentavos = li.unit_price_centavos * li.qty;
+            const lineDiscountCentavos = li.discount_centavos ?? 0;
+            const lineTotalCentavos = lineSubtotalCentavos - lineDiscountCentavos;
+            const isFreebie = lineSubtotalCentavos > 0 && lineDiscountCentavos >= lineSubtotalCentavos;
+            return (
             <div key={li.id} className="line">
               <div className="stack" style={{ gap: 4, flex: 1 }}>
                 <strong>{li.product_name ?? "Item"}</strong>
                 <span className="muted" style={{ fontSize: 13 }}>
                   Qty {li.qty} × {formatPhp(li.unit_price_centavos)}
                 </span>
-                <span>{formatPhp(li.unit_price_centavos * li.qty - (li.discount_centavos ?? 0))}</span>
+                {lineDiscountCentavos > 0 && !isFreebie ? (
+                  <span className="muted" style={{ fontSize: 13 }}>
+                    Discount −{formatPhp(lineDiscountCentavos)}
+                  </span>
+                ) : null}
+                <span>
+                  {isFreebie ? `${formatPhp(lineTotalCentavos)} (FREEBIE)` : formatPhp(lineTotalCentavos)}
+                </span>
               </div>
               <div className="row" style={{ gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                <button type="button" className="ghost-btn" style={{ padding: "4px 8px", fontSize: 12 }} onClick={() => void updateLineQty(li, li.qty - 1)}>
-                  −
+                <button
+                  type="button"
+                  className="cart-action-btn"
+                  title="Deduct quantity"
+                  aria-label="Deduct quantity"
+                  onClick={() => void updateLineQty(li, li.qty - 1)}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                  </svg>
                 </button>
-                <button type="button" className="ghost-btn" style={{ padding: "4px 8px", fontSize: 12 }} onClick={() => void updateLineQty(li, li.qty + 1)}>
-                  +
+                <button
+                  type="button"
+                  className="cart-action-btn"
+                  title="Add quantity"
+                  aria-label="Add quantity"
+                  onClick={() => void updateLineQty(li, li.qty + 1)}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                  </svg>
                 </button>
-                <button type="button" className="ghost-btn" style={{ padding: "4px 8px", fontSize: 12 }} onClick={() => void updateLineQty(li, 0)}>
-                  Remove
+                <button
+                  type="button"
+                  className="cart-action-btn is-danger"
+                  title="Remove item"
+                  aria-label="Remove item"
+                  onClick={() => void updateLineQty(li, 0)}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="3 6 5 6 21 6"></polyline>
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    <line x1="10" y1="11" x2="10" y2="17"></line>
+                    <line x1="14" y1="11" x2="14" y2="17"></line>
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  className={`cart-action-btn ${isFreebie ? "is-active" : ""}`}
+                  title={isFreebie ? "Remove freebie status" : "Mark as freebie"}
+                  aria-label={isFreebie ? "Remove freebie status" : "Mark as freebie"}
+                  onClick={() => void setLineFreebie(li, !isFreebie)}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="20 12 20 22 4 22 4 12"></polyline>
+                    <rect x="2" y="7" width="20" height="5"></rect>
+                    <line x1="12" y1="22" x2="12" y2="7"></line>
+                    <path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"></path>
+                    <path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"></path>
+                  </svg>
                 </button>
                 {canVoid ? (
-                  <button type="button" className="ghost-btn" style={{ padding: "4px 8px", fontSize: 12 }} onClick={() => void voidLine(li)}>
-                    Void
+                  <button
+                    type="button"
+                    className="cart-action-btn is-danger"
+                    title="Void line item"
+                    aria-label="Void line item"
+                    onClick={() => void voidLine(li)}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line>
+                    </svg>
                   </button>
                 ) : null}
               </div>
             </div>
-            ))}
+            );
+            })}
           </div>
+
+          {ticketId ? (
+            <div className="stack" style={{ gap: 8, background: "var(--bg-elevated)", padding: 8, borderRadius: 6 }}>
+              <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
+                <button
+                  type="button"
+                  className={selectedTicketType === "takeout" ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
+                  onClick={() => void chooseTicketType("takeout")}
+                >
+                  Takeout
+                </button>
+                <button
+                  type="button"
+                  className={selectedTicketType === "dine_in" ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
+                  onClick={() => void chooseTicketType("dine_in")}
+                >
+                  Dine-in
+                </button>
+              </div>
+              <div className="stack" style={{ gap: 8 }}>
+                <button
+                  type="button"
+                  className="ghost-btn tiny-btn"
+                  style={{ alignSelf: "flex-start" }}
+                  onClick={() => setDemographicExpanded((prev) => !prev)}
+                >
+                  {demographicExpanded ? "Hide demographic" : demographicColor ? "Show demographic (selected)" : "Show demographic"}
+                </button>
+                {demographicExpanded ? (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
+                    {[
+                      { value: "blue", label: "Student", bg: "#3b82f6" },
+                      { value: "green", label: "Pro", bg: "#22c55e" },
+                      { value: "red", label: "Family", bg: "#ef4444" },
+                      { value: "yellow", label: "Senior", bg: "#eab308" },
+                      { value: "purple", label: "Tourist", bg: "#a855f7" },
+                      { value: "orange", label: "Couple", bg: "#f97316" },
+                      { value: "pink", label: "Teen", bg: "#ec4899" },
+                      { value: "brown", label: "Group", bg: "#8b4513" },
+                    ].map((c) => (
+                      <button
+                        key={c.value}
+                        type="button"
+                        onClick={async () => {
+                          await updateTicketMeta({ demographicColor: demographicColor === c.value ? "" : c.value });
+                          if (demographicColor !== c.value) setDemographicExpanded(false);
+                        }}
+                        style={{
+                          display: "flex",
+                          flexDirection: "column",
+                          alignItems: "center",
+                          gap: 6,
+                          padding: "10px 4px",
+                          borderRadius: 12,
+                          background: demographicColor === c.value ? `${c.bg}15` : "#fff",
+                          border: `1px solid ${demographicColor === c.value ? c.bg : "var(--border)"}`,
+                          cursor: "pointer",
+                          transition: "all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1)",
+                          boxShadow: demographicColor === c.value ? `0 4px 12px ${c.bg}30` : "0 2px 4px rgba(0,0,0,0.02)",
+                          transform: demographicColor === c.value ? "translateY(-2px)" : "none",
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: 28,
+                            height: 28,
+                            borderRadius: "50%",
+                            background: c.bg,
+                            boxShadow: "inset 0 2px 4px rgba(255,255,255,0.4), 0 2px 5px rgba(0,0,0,0.1)",
+                            border: demographicColor === c.value ? "2px solid #fff" : "2px solid transparent",
+                            outline: demographicColor === c.value ? `2px solid ${c.bg}` : "none",
+                          }}
+                        />
+                        <span
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 700,
+                            color: demographicColor === c.value ? c.bg : "var(--muted)",
+                            textTransform: "uppercase",
+                            letterSpacing: "0.02em",
+                          }}
+                        >
+                          {c.label}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <span className="muted" style={{ fontSize: 12 }}>
+                    {demographicColor ? "Demographic selected" : "No demographic selected"}
+                  </span>
+                )}
+              </div>
+            </div>
+          ) : null}
 
           {totals ? (
             <div className="stack" style={{ gap: 4, fontSize: 14 }}>
               <div className="row" style={{ justifyContent: "space-between" }}>
                 <span className="muted">Subtotal</span>
-                <span>{formatPhp(totals.lineSubtotalCentavos)}</span>
+                <span>{formatPhp(totals.lineGrossCentavos ?? totals.lineSubtotalCentavos)}</span>
               </div>
               <div className="row" style={{ justifyContent: "space-between" }}>
                 <span className="muted">Order discount</span>
-                <span>-{formatPhp(totals.orderDiscountCentavos)}</span>
+                <span style={{ color: (totals.totalDiscountCentavos ?? 0) > 0 ? "#ef4444" : undefined }}>
+                  −{formatPhp(totals.totalDiscountCentavos ?? 0)}
+                </span>
               </div>
               {(totals.taxByRate?.length ?? 0) > 0
                 ? (totals.taxByRate ?? []).map((tr) => (
@@ -766,33 +1225,6 @@ export function PosPage() {
                 <span>Due</span>
                 <span>{formatPhp(totals.dueCentavos)}</span>
               </div>
-              <div className="row" style={{ justifyContent: "space-between" }}>
-                <span className="muted">Paid</span>
-                <span>{formatPhp(totals.paidCompletedCentavos)}</span>
-              </div>
-              <div className="row" style={{ justifyContent: "space-between" }}>
-                <span className="muted">Remaining</span>
-                <span>{formatPhp(totals.remainingDueCentavos)}</span>
-              </div>
-            </div>
-          ) : null}
-
-          {ticketId ? (
-            <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
-              <button
-                type="button"
-                className={selectedTipPct === 10 ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
-                onClick={() => void applyTipPercent(10)}
-              >
-                Tip 10%
-              </button>
-              <button
-                type="button"
-                className={selectedTipPct === 15 ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
-                onClick={() => void applyTipPercent(15)}
-              >
-                Tip 15%
-              </button>
             </div>
           ) : null}
 
@@ -817,7 +1249,7 @@ export function PosPage() {
             <button
               type="button"
               className="primary-btn"
-              disabled={!ticketId || !selectedTicketType || !totals || totals.dueCentavos === 0}
+              disabled={!canPaySplit}
               onClick={() => setPayOpen(true)}
             >
               <span className="btn-icon">💳</span>
@@ -866,16 +1298,17 @@ export function PosPage() {
               </button>
             </div>
             {payTab === "cash" ? (
-              <form className="stack" onSubmit={payCash}>
+              <form className="stack" onSubmit={payCash} autoComplete="off">
                 <div className="label">Cash amount (PHP)</div>
                 <input
                   className="field"
-                  name="pesos"
                   type="number"
                   step="0.01"
                   min="0"
                   value={cashPesosInput}
                   onChange={(e) => setCashPesosInput(e.target.value)}
+                  autoComplete="off"
+                  placeholder="0.00"
                   required
                 />
                 <div className="label">Rounding adjustment (centavos, optional)</div>
@@ -896,7 +1329,7 @@ export function PosPage() {
                     </strong>
                   </div>
                 </div>
-                <button className="primary-btn" type="submit">
+                <button className="primary-btn" type="submit" disabled={cashDeltaCentavos < 0}>
                   <span className="btn-icon">🧾</span>
                   <span>Record cash</span>
                 </button>
@@ -915,6 +1348,12 @@ export function PosPage() {
                   <span>Start GCash</span>
                 </button>
               </form>
+            ) : null}
+            {totals.remainingDueCentavos === 0 ? (
+              <button type="button" className="primary-btn" onClick={() => void closeMarketingFreebieTicket()}>
+                <span className="btn-icon">📣</span>
+                <span>Submit as marketing freebie</span>
+              </button>
             ) : null}
           </div>
         </div>
@@ -1003,20 +1442,76 @@ export function PosPage() {
         </div>
       ) : null}
 
-      {feedbackOpen ? (
+      {cashReceiptModal ? (
         <div className="sheet" role="dialog">
-          <div className="sheet-inner stack">
-            <h2 style={{ margin: 0 }}>Customer Feedback</h2>
-            <form className="stack" onSubmit={submitFeedback}>
-              <div className="label">Rating (1-5)</div>
-              <input className="field" name="rating" type="number" min="1" max="5" defaultValue={ticketFeedback.rating ?? 5} required />
-              <div className="label">Notes / Comments</div>
-              <textarea className="field" name="notes" defaultValue={ticketFeedback.notes} placeholder="What did they say?" style={{ minHeight: 80, resize: "vertical" }} />
-              <div className="row" style={{ marginTop: 12 }}>
-                <button className="primary-btn" type="submit">Save</button>
-                <button type="button" className="ghost-btn" onClick={() => setFeedbackOpen(false)}>Cancel</button>
-              </div>
-            </form>
+          <div className="sheet-inner stack" style={{ maxWidth: 760 }}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+              <h2 style={{ margin: 0 }}>
+                Receipt {cashReceiptDetail?.ticket?.ticket_no ? `#${String(cashReceiptDetail.ticket.ticket_no).padStart(4, "0")}` : ""}
+              </h2>
+              <button type="button" className="ghost-btn tiny-btn" onClick={() => { setCashReceiptModal(false); setCashReceiptDetail(null); setCashReceiptError(null); }}>✕ Close</button>
+            </div>
+            {cashReceiptLoading ? <div className="muted">Loading ticket receipt...</div> : null}
+            {cashReceiptError ? <div style={{ color: "#ef4444", fontSize: 13 }}>{cashReceiptError}</div> : null}
+            {cashReceiptDetail && !cashReceiptLoading && !cashReceiptError ? (
+              <>
+                <div style={{ display: "grid", placeItems: "center", padding: "6px 0 2px" }}>
+                  <div
+                    style={{
+                      width: "100%",
+                      maxWidth: 430,
+                      background: "#fff",
+                      color: "#111",
+                      border: "1px solid #e5e7eb",
+                      borderRadius: 14,
+                      boxShadow: "0 14px 34px rgba(0,0,0,.12)",
+                      padding: "22px 20px",
+                    }}
+                  >
+                    <div style={{ textAlign: "center", marginBottom: 8, fontWeight: 800, fontSize: 15, letterSpacing: ".04em" }}>
+                      OFFICIAL RECEIPT
+                    </div>
+                    <div style={{ borderTop: "1px dashed #d1d5db", margin: "8px 0 10px" }} />
+                    <pre
+                      style={{
+                        margin: 0,
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                        fontFamily: "'JetBrains Mono', 'Courier New', monospace",
+                        fontSize: 12,
+                        lineHeight: 1.45,
+                        color: "#111",
+                      }}
+                    >
+                      {String(cashReceiptDetail?.textReceipt ?? "")}
+                    </pre>
+                    <div style={{ borderTop: "1px dashed #d1d5db", margin: "12px 0 8px" }} />
+                    <div style={{ textAlign: "center", fontSize: 10, color: "#6b7280" }}>
+                      Generated from ticket {String(cashReceiptDetail?.ticket?.id ?? "").slice(0, 8)}
+                    </div>
+                  </div>
+                </div>
+                <div className="row" style={{ justifyContent: "center", gap: 10, marginTop: 4 }}>
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    onClick={() => {
+                      const w = window.open("", "_blank");
+                      if (!w) return;
+                      w.document.write(`<!doctype html><html><head><title>Receipt</title><style>body{margin:0;padding:24px;background:#f3f4f6;font-family:system-ui} .paper{max-width:420px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:22px 20px} .title{text-align:center;font-weight:800;letter-spacing:.04em;font-size:15px} pre{white-space:pre-wrap;word-break:break-word;font:12px/1.45 'Courier New',monospace;color:#111;margin:0} .line{border-top:1px dashed #d1d5db;margin:10px 0}</style></head><body><div class="paper"><div class="title">OFFICIAL RECEIPT</div><div class="line"></div><pre>${String(cashReceiptDetail?.textReceipt ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre></div></body></html>`);
+                      w.document.close();
+                      w.focus();
+                      setTimeout(() => w.print(), 250);
+                    }}
+                  >
+                    Print Receipt
+                  </button>
+                  <button type="button" className="ghost-btn" onClick={() => { setCashReceiptModal(false); setCashReceiptDetail(null); setCashReceiptError(null); }}>
+                    Close
+                  </button>
+                </div>
+              </>
+            ) : null}
           </div>
         </div>
       ) : null}

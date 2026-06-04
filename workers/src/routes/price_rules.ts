@@ -46,3 +46,14 @@ priceRuleRoutes.post("/", requireAuth(), requireManager(), async (c) => {
     .run();
   return c.json({ id });
 });
+
+priceRuleRoutes.delete("/:id", requireAuth(), requireManager(), async (c) => {
+  const auth = c.get("auth")!;
+  const id = c.req.param("id");
+  const existing = await c.env.DB.prepare(`SELECT id FROM price_rules WHERE id = ? AND org_id = ?`)
+    .bind(id, auth.orgId)
+    .first<{ id: string }>();
+  if (!existing) return c.json({ error: "not_found" }, 404);
+  await c.env.DB.prepare(`DELETE FROM price_rules WHERE id = ? AND org_id = ?`).bind(id, auth.orgId).run();
+  return c.json({ ok: true });
+});

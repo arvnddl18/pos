@@ -26,8 +26,8 @@ export default function App() {
         <Route path="/setup" element={<SetupPage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/receipt/:ticketId" element={<ReceiptPrintPage />} />
+        <Route path="/" element={<Navigate to="/login" replace />} />
         <Route element={<ShellLayout />}>
-          <Route path="/" element={<Navigate to="/pos" replace />} />
           <Route path="/pos" element={<PosPage />} />
           <Route path="/admin" element={<AdminPage />} />
           <Route path="/reports" element={<ReportsPage />} />

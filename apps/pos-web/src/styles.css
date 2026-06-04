@@ -343,6 +343,7 @@ select {
   grid-template-columns: 1fr 360px;
   gap: 18px;
   align-items: start;
+  min-height: 0;
 }
 
 .cart {
@@ -358,7 +359,7 @@ select {
 
 .cart-lines {
   overflow: auto;
-  max-height: 36vh;
+  max-height: 24vh;
   padding-right: 4px;
 }
 
@@ -483,6 +484,22 @@ select {
   align-items: end;
 }
 
+.pos-action-bar {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.pos-icon-btn {
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  padding: 0;
+  border-radius: 12px;
+  font-size: 18px;
+  line-height: 1;
+}
+
 .pos-search {
   margin-right: 10px;
 }
@@ -509,6 +526,8 @@ select {
   background: var(--panel);
   box-shadow: 0 4px 15px rgba(27, 18, 11, 0.04);
   transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+  min-height: min-content;
+  height: 100%;
 }
 
 .product-tile:hover {
@@ -560,6 +579,7 @@ select {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  flex: 1 0 auto;
 }
 
 .product-category {
@@ -585,9 +605,31 @@ select {
   font-weight: 800;
 }
 
+.product-tile .price-regular {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.product-tile .price-sale {
+  color: var(--accent, #e85d04);
+}
+
 .product-tile.out-of-stock {
   opacity: 0.6;
   filter: grayscale(0.5);
+}
+
+.pos-products-pane {
+  min-height: 0;
+}
+
+.pos-products-scroll {
+  max-height: calc(100vh - 280px);
+  min-height: 400px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 .table-wrap {
   width: 100%;
@@ -724,4 +766,52 @@ select {
   .pos-topbar {
     grid-template-columns: 1fr;
   }
+
+  .pos-action-bar {
+    justify-content: flex-start;
+  }
+
+  .pos-products-scroll {
+    max-height: calc(100vh - 240px);
+  }
+}
+
+/* Premium Cart Action Icon Buttons */
+.cart-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  padding: 0;
+}
+
+.cart-action-btn:hover {
+  background: var(--border-subtle);
+  transform: scale(1.08);
+}
+
+.cart-action-btn.is-danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+}
+
+.cart-action-btn.is-danger:hover {
+  background: color-mix(in srgb, var(--danger) 8%, #fff);
+}
+
+.cart-action-btn.is-active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.cart-action-btn.is-active:hover {
+  background: var(--accent-strong);
 }

@@ -18,6 +18,9 @@ export function AdminPage() {
   const [modifiers, setModifiers] = useState<Modifier[]>([]);
   const [msg, setMsg] = useState<string | null>(null);
   const [showAddProduct, setShowAddProduct] = useState(false);
+  const [showEditProduct, setShowEditProduct] = useState(false);
+  const [editingProduct, setEditingProduct] = useState<Product | null>(null);
+  const [editProductModGroupId, setEditProductModGroupId] = useState<string>("");
   const [showLinkGroup, setShowLinkGroup] = useState(false);
   const [showAddCategory, setShowAddCategory] = useState(false);
   const [showAddTax, setShowAddTax] = useState(false);
@@ -105,6 +108,24 @@ export function AdminPage() {
     return () => window.removeEventListener("pos:data-changed", onChanged);
   }, []);
 
+  useEffect(() => {
+    if (!editingProduct) {
+      setEditProductModGroupId("");
+      return;
+    }
+    api<{ modifierGroups: { id: string }[] }>(`/catalog/products/${editingProduct.id}/pos-detail`)
+      .then((res) => {
+        if (res.modifierGroups && res.modifierGroups.length > 0) {
+          setEditProductModGroupId(res.modifierGroups[0].id);
+        } else {
+          setEditProductModGroupId("");
+        }
+      })
+      .catch(() => {
+        setEditProductModGroupId("");
+      });
+  }, [editingProduct]);
+
   async function createProduct(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setMsg(null);
@@ -117,7 +138,7 @@ export function AdminPage() {
       if (imageFile instanceof File && imageFile.size > 0) {
         imageR2Key = await uploadProductImage(imageFile);
       }
-      await api("/catalog/products", {
+      const result = await api<{ id: string }>("/catalog/products", {
         method: "POST",
         json: {
           name: String(fd.get("name") ?? ""),
@@ -134,6 +155,13 @@ export function AdminPage() {
           })(),
         },
       });
+      const modGroupId = String(fd.get("modifierGroupId") ?? "").trim();
+      if (modGroupId && result.id) {
+        await api(`/catalog/products/${result.id}/modifier-groups`, {
+          method: "POST",
+          json: { modifierGroupId: modGroupId },
+        });
+      }
       e.currentTarget.reset();
       setShowAddProduct(false);
       setMsg("Product created");
@@ -147,22 +175,73 @@ export function AdminPage() {
     setMsg("Updated");
   }
 
+  async function updateProduct(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!editingProduct) return;
+    setMsg(null);
+    const fd = new FormData(e.currentTarget);
+    const categoryId = String(fd.get("categoryId") ?? "").trim();
+    const taxId = String(fd.get("taxProfileId") ?? "").trim();
+    const imageFile = fd.get("imageFile");
+    try {
+      let imageR2Key: string | null | undefined = undefined;
+      if (imageFile instanceof File && imageFile.size > 0) {
+        imageR2Key = await uploadProductImage(imageFile);
+      }
+
+      const patchData: Record<string, unknown> = {
+        name: String(fd.get("name") ?? ""),
+        priceCentavos: Math.round(Number(fd.get("price") ?? "0") * 100),
+        categoryId: categoryId || null,
+        taxProfileId: taxId || null,
+        sku: String(fd.get("sku") ?? "") || null,
+        barcode: String(fd.get("barcode") ?? "") || null,
+        isRetail: fd.get("isRetail") === "on",
+        namesI18n: (() => {
+          const en = String(fd.get("nameEn") ?? "").trim();
+          return en ? { en } : undefined;
+        })(),
+      };
+
+      if (imageR2Key !== undefined) {
+        patchData.imageR2Key = imageR2Key;
+      }
+
+      await api(`/catalog/products/${editingProduct.id}`, {
+        method: "PATCH",
+        json: patchData,
+      });
+
+      const modGroupId = String(fd.get("modifierGroupId") ?? "").trim();
+      if (modGroupId) {
+        await api(`/catalog/products/${editingProduct.id}/modifier-groups`, {
+          method: "POST",
+          json: { modifierGroupId: modGroupId },
+        });
+      } else {
+        await api(`/catalog/products/${editingProduct.id}/modifier-groups`, {
+          method: "DELETE",
+          json: {},
+        });
+      }
+
+      setShowEditProduct(false);
+      setEditingProduct(null);
+      setEditProductModGroupId("");
+      setMsg("Product updated");
+      void reloadAll();
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : "Error");
+    }
+  }
+
   async function removeProduct(id: string) {
     if (!window.confirm("Remove this product?")) return;
     await api(`/catalog/products/${id}`, { method: "DELETE", json: {} });
     setMsg("Product removed");
   }
 
-  async function editProductPrice(product: Product) {
-    const raw = window.prompt("New price PHP", String(Number(product.price_centavos) / 100));
-    if (raw === null) return;
-    const nextPricePhp = Number(raw);
-    if (!Number.isFinite(nextPricePhp) || nextPricePhp < 0) {
-      setMsg("Invalid price");
-      return;
-    }
-    await patchProduct(String(product.id), { priceCentavos: Math.round(nextPricePhp * 100) });
-  }
+
 
   async function createCategory(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -238,8 +317,8 @@ export function AdminPage() {
         json: {
           name: String(fd.get("name")),
           required: fd.get("required") === "on",
-          minSelect: Number(fd.get("minSel") ?? 0),
-          maxSelect: Number(fd.get("maxSel") ?? 99),
+          minSelect: fd.get("minSel") ? Number(fd.get("minSel")) : 0,
+          maxSelect: fd.get("maxSel") ? Number(fd.get("maxSel")) : 99,
           exclusive: fd.get("exclusive") === "on",
         },
       });
@@ -396,11 +475,18 @@ export function AdminPage() {
                           </span>
                           <span>Status</span>
                         </button>
-                        <button type="button" className={actionButtonClassName()} onClick={() => void editProductPrice(p)}>
+                        <button
+                          type="button"
+                          className={actionButtonClassName()}
+                          onClick={() => {
+                            setEditingProduct(p);
+                            setShowEditProduct(true);
+                          }}
+                        >
                           <span className="btn-icon" aria-hidden="true">
-                            ₱
+                            ✏
                           </span>
-                          <span>Price</span>
+                          <span>Edit</span>
                         </button>
                         <button type="button" className={actionButtonClassName("danger")} onClick={() => void removeProduct(String(p.id))}>
                           <span className="btn-icon" aria-hidden="true">
@@ -669,7 +755,7 @@ export function AdminPage() {
                   </tr>
                 </thead>
                 <tbody>
-                {pageRows(modifiers, modifierPage, MODIFIER_PAGE_SIZE).map((m) => (
+                  {pageRows(modifiers, modifierPage, MODIFIER_PAGE_SIZE).map((m) => (
                     <tr key={m.id}>
                       <td>{m.name}</td>
                       <td>{modGroups.find((g) => g.id === m.modifier_group_id)?.name ?? "-"}</td>
@@ -744,6 +830,14 @@ export function AdminPage() {
                   </option>
                 ))}
               </select>
+              <select className="field" name="modifierGroupId" defaultValue="">
+                <option value="">No modifier group</option>
+                {modGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
               <select className="field" name="taxProfileId" defaultValue="">
                 <option value="">No tax profile</option>
                 {taxProfiles.map((tp) => (
@@ -761,6 +855,105 @@ export function AdminPage() {
               <button className="primary-btn" type="submit">
                 <span className="btn-icon">＋</span>
                 <span>Add product</span>
+              </button>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {showEditProduct && editingProduct ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <h2 style={{ margin: 0 }}>Edit product</h2>
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={() => {
+                  setShowEditProduct(false);
+                  setEditingProduct(null);
+                }}
+              >
+                <span className="btn-icon">✕</span>
+                <span>Close</span>
+              </button>
+            </div>
+            <form className="stack" onSubmit={updateProduct}>
+              <input className="field" name="name" placeholder="Name" defaultValue={String(editingProduct.name ?? "")} required />
+              <input
+                className="field"
+                name="nameEn"
+                placeholder="English name (i18n, optional)"
+                defaultValue={(() => {
+                  if (editingProduct.names_i18n_json) {
+                    try {
+                      const parsed = JSON.parse(String(editingProduct.names_i18n_json));
+                      return parsed?.en ?? "";
+                    } catch {
+                      return "";
+                    }
+                  }
+                  return "";
+                })()}
+              />
+              <input
+                className="field"
+                name="price"
+                type="number"
+                step="0.01"
+                placeholder="Price PHP"
+                defaultValue={Number(editingProduct.price_centavos ?? 0) / 100}
+                required
+              />
+              <div className="stack" style={{ gap: 4 }}>
+                <label className="muted" style={{ fontSize: 12 }}>
+                  Image (optional, leave empty to keep current)
+                </label>
+                <input className="field" name="imageFile" type="file" accept="image/*" />
+                {editingProduct.image_r2_key ? (
+                  <span className="muted" style={{ fontSize: 11 }}>
+                    Current: {String(editingProduct.image_r2_key)}
+                  </span>
+                ) : null}
+              </div>
+              <select className="field" name="categoryId" defaultValue={String(editingProduct.category_id ?? "")}>
+                <option value="">No category</option>
+                {categories.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="field"
+                name="modifierGroupId"
+                value={editProductModGroupId}
+                onChange={(e) => setEditProductModGroupId(e.target.value)}
+              >
+                <option value="">No modifier group</option>
+                {modGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+              <select className="field" name="taxProfileId" defaultValue={String(editingProduct.tax_profile_id ?? "")}>
+                <option value="">No tax profile</option>
+                {taxProfiles.map((tp) => (
+                  <option key={tp.id} value={tp.id}>
+                    {tp.name} ({tp.rate_bps / 100}%)
+                  </option>
+                ))}
+              </select>
+              <input className="field" name="sku" placeholder="SKU" defaultValue={String(editingProduct.sku ?? "")} />
+              <input className="field" name="barcode" placeholder="Barcode" defaultValue={String(editingProduct.barcode ?? "")} />
+              <label className="row">
+                <input type="checkbox" name="isRetail" defaultChecked={editingProduct.is_retail === 1} />
+                Retail / track stock
+              </label>
+              <button className="primary-btn" type="submit">
+                <span className="btn-icon">✓</span>
+                <span>Update product</span>
               </button>
             </form>
           </div>

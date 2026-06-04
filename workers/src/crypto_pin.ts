@@ -1,4 +1,4 @@
-const PBKDF2_ITERATIONS = 120_000;
+const PBKDF2_ITERATIONS = 80_000;
 
 function bytesToHex(bytes: ArrayBuffer): string {
   return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");

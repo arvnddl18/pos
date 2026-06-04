@@ -59,6 +59,13 @@ analyticsRoutes.get("/kpi", requireAuth(), requireManager(), async (c) => {
      GROUP BY pr.name ORDER BY sold DESC LIMIT 1`
   ).bind(auth.orgId).first<{ name: string; sold: number }>();
 
+  const cupsSold = await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(li.qty), 0) as total
+     FROM line_items li
+     JOIN tickets t ON t.id = li.ticket_id
+     WHERE t.org_id = ? AND t.status = 'paid' AND li.voided = 0 ${demoClause} ${dc}`
+  ).bind(auth.orgId).first<{ total: number }>();
+
   const peakHour = await c.env.DB.prepare(
     `SELECT strftime('%H', t.created_at) as hour, COUNT(t.id) as count
      FROM tickets t WHERE t.org_id = ? AND t.status = 'paid' ${demoClause} ${dc}
@@ -72,6 +79,7 @@ analyticsRoutes.get("/kpi", requireAuth(), requireManager(), async (c) => {
     totalTickets: Number(totals?.total_tickets ?? 0),
     totalRevenueCentavos: Number(totals?.total_revenue ?? 0),
     avgOrderValueCentavos: avgOrderValue,
+    totalCupsSold: Number(cupsSold?.total ?? 0),
     dineInCount: Number(totals?.dine_in_count ?? 0),
     takeoutCount: Number(totals?.takeout_count ?? 0),
     avgRating: totals?.avg_rating ?? null,
@@ -144,7 +152,7 @@ analyticsRoutes.get("/trends/products", requireAuth(), requireManager(), async (
 
   const results = await c.env.DB.prepare(
     `SELECT pr.name, COUNT(li.id) as sold_count,
-       COALESCE(SUM(li.unit_price_centavos * li.qty), 0) as revenue
+       COALESCE(SUM(li.unit_price_centavos * li.qty - li.discount_centavos), 0) as revenue
      FROM line_items li
      JOIN tickets t ON t.id = li.ticket_id
      JOIN products pr ON pr.id = li.product_id
@@ -217,7 +225,8 @@ analyticsRoutes.get("/forecast/7day", requireAuth(), requireManager(), async (c)
       );
     }
 
-    let forecasts: DailyForecast[];
+    let forecastResult;
+    let actuallyUsedAI = false;
 
     // Try to use AI if available
     if (
@@ -226,24 +235,26 @@ analyticsRoutes.get("/forecast/7day", requireAuth(), requireManager(), async (c)
       c.env.OPENROUTER_MODEL
     ) {
       try {
-        forecasts = await generateForecastWithAI(
+        forecastResult = await generateForecastWithAI(
           c.env.OPENROUTER_API_KEY,
           c.env.OPENROUTER_MODEL,
           historicalData
         );
+        actuallyUsedAI = true;
       } catch (aiError) {
         console.warn("AI forecasting failed, falling back to statistical:", aiError);
         // Fall back to statistical forecasting
-        forecasts = generateStatisticalForecast(historicalData);
+        forecastResult = generateStatisticalForecast(historicalData);
       }
     } else {
       // Use statistical forecasting
-      forecasts = generateStatisticalForecast(historicalData);
+      forecastResult = generateStatisticalForecast(historicalData);
     }
 
     return c.json({
-      forecasts,
-      usedAI: useAI && c.env.OPENROUTER_API_KEY ? true : false,
+      forecasts: forecastResult.forecasts,
+      insights: forecastResult.insights,
+      usedAI: actuallyUsedAI,
       historicalDataPoints: historicalData.reduce(
         (sum, p) => sum + p.dailyData.length,
         0
@@ -277,12 +288,12 @@ analyticsRoutes.get("/forecast/product/:productId", requireAuth(), requireManage
       return c.json({ error: "Product not found in historical data" }, 404);
     }
 
-    const forecasts = generateStatisticalForecast([productData]);
+    const result = generateStatisticalForecast([productData]);
 
     return c.json({
       productId,
       productName: productData.productName,
-      forecasts: forecasts.map((f) => ({
+      forecasts: result.forecasts.map((f) => ({
         date: f.date,
         forecastedUnits: f.byProduct[0]?.forecastedUnits || 0,
         confidence: f.byProduct[0]?.confidence || 0.7,
@@ -318,11 +329,11 @@ analyticsRoutes.get("/forecast/accuracy", requireAuth(), requireManager(), async
 
     // Generate current forecast for comparison
     const historicalData = await getHistoricalSalesData(c.env.DB, auth.orgId, 30);
-    const forecasts = generateStatisticalForecast(historicalData);
+    const result = generateStatisticalForecast(historicalData);
 
     return c.json({
       actual: forecastRes.results ?? [],
-      forecast: forecasts.slice(0, 7),
+      forecast: result.forecasts.slice(0, 7),
     });
   } catch (error) {
     console.error("Accuracy check error:", error);

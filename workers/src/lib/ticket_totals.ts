@@ -56,35 +56,35 @@ export async function getTicketAdjustments(db: D1Database, ticketId: string): Pr
  * Prices are tax-exclusive. VAT = sum over lines of round((taxable_line_centavos * rate_bps) / 10000),
  * where taxable_line_centavos = line_net - proportional share of order discount.
  */
-export async function computeTicketTotals(db: D1Database, ticketId: string): Promise<{
+export function computeTicketTotalsFromRows(
+  adj: TicketAdjustmentRow,
+  lines: { qty: number; unit_price_centavos: number; discount_centavos: number | null; rate_bps: number | null }[]
+): {
+  lineGrossCentavos: number;
+  lineItemDiscountCentavos: number;
   lineSubtotalCentavos: number;
   orderDiscountCentavos: number;
+  totalDiscountCentavos: number;
   serviceChargeCentavos: number;
   tipCentavos: number;
   taxCentavos: number;
   taxByRate: TaxLineDetail[];
   dueCentavos: number;
-}> {
-  const adj = await getTicketAdjustments(db, ticketId);
-  const rows = await db
-    .prepare(
-      `SELECT li.qty, li.unit_price_centavos, li.discount_centavos, tp.rate_bps
-       FROM line_items li
-       JOIN products p ON p.id = li.product_id
-       LEFT JOIN tax_profiles tp ON tp.id = p.tax_profile_id
-       WHERE li.ticket_id = ? AND li.voided = 0`,
-    )
-    .bind(ticketId)
-    .all<{ qty: number; unit_price_centavos: number; discount_centavos: number | null; rate_bps: number | null }>();
-
+} {
   const lineNets: { net: number; rateBps: number }[] = [];
-  for (const r of rows.results ?? []) {
-    const net = Math.max(0, r.unit_price_centavos * r.qty - (r.discount_centavos ?? 0));
+  let lineGross = 0;
+  let lineItemDiscount = 0;
+  for (const r of lines) {
+    const gross = r.unit_price_centavos * r.qty;
+    const disc = r.discount_centavos ?? 0;
+    lineGross += gross;
+    lineItemDiscount += disc;
+    const net = Math.max(0, gross - disc);
     lineNets.push({ net, rateBps: r.rate_bps ?? 0 });
   }
 
-  const lineSubtotal = lineNets.reduce((s, x) => s + x.net, 0);
-  const orderDiscount = Math.min(Math.max(0, adj.order_discount_centavos), lineSubtotal);
+  const lineNetSubtotal = lineNets.reduce((s, x) => s + x.net, 0);
+  const orderDiscount = Math.min(Math.max(0, adj.order_discount_centavos), lineNetSubtotal);
   const alloc = allocateOrderDiscountCentavos(
     lineNets.map((x) => x.net),
     orderDiscount,
@@ -106,18 +106,48 @@ export async function computeTicketTotals(db: D1Database, ticketId: string): Pro
 
   const dueCentavos = Math.max(
     0,
-    lineSubtotal - orderDiscount + taxCentavos + adj.service_charge_centavos + adj.tip_centavos,
+    lineNetSubtotal - orderDiscount + taxCentavos + adj.service_charge_centavos + adj.tip_centavos,
   );
 
   return {
-    lineSubtotalCentavos: lineSubtotal,
+    lineGrossCentavos: lineGross,
+    lineItemDiscountCentavos: lineItemDiscount,
+    lineSubtotalCentavos: lineNetSubtotal,
     orderDiscountCentavos: orderDiscount,
+    totalDiscountCentavos: lineItemDiscount + orderDiscount,
     serviceChargeCentavos: adj.service_charge_centavos,
     tipCentavos: adj.tip_centavos,
     taxCentavos,
     taxByRate,
     dueCentavos,
   };
+}
+
+export async function computeTicketTotals(db: D1Database, ticketId: string): Promise<{
+  lineGrossCentavos: number;
+  lineItemDiscountCentavos: number;
+  lineSubtotalCentavos: number;
+  orderDiscountCentavos: number;
+  totalDiscountCentavos: number;
+  serviceChargeCentavos: number;
+  tipCentavos: number;
+  taxCentavos: number;
+  taxByRate: TaxLineDetail[];
+  dueCentavos: number;
+}> {
+  const adj = await getTicketAdjustments(db, ticketId);
+  const rows = await db
+    .prepare(
+      `SELECT li.qty, li.unit_price_centavos, li.discount_centavos, tp.rate_bps
+       FROM line_items li
+       JOIN products p ON p.id = li.product_id
+       LEFT JOIN tax_profiles tp ON tp.id = p.tax_profile_id
+       WHERE li.ticket_id = ? AND li.voided = 0`,
+    )
+    .bind(ticketId)
+    .all<{ qty: number; unit_price_centavos: number; discount_centavos: number | null; rate_bps: number | null }>();
+
+  return computeTicketTotalsFromRows(adj, rows.results ?? []);
 }
 
 export async function computeTicketDueCentavos(db: D1Database, ticketId: string): Promise<number> {

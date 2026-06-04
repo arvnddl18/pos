@@ -1,9 +1,11 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { api, formatPhp } from "../api.js";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line,
 } from "recharts";
+import ExcelJS from "exceljs";
+import { saveAs } from "file-saver";
 
 const DEMOGRAPHICS = [
   { value: "", label: "All Profiles" },
@@ -24,7 +26,7 @@ const DEMO_COLORS: Record<string, string> = {
 const CHART_COLORS = ["#ee8a2f","#3b82f6","#22c55e","#ef4444","#a855f7","#eab308","#ec4899","#92400e"];
 
 type Kpi = {
-  totalTickets: number; totalRevenueCentavos: number; avgOrderValueCentavos: number;
+  totalTickets: number; totalRevenueCentavos: number; avgOrderValueCentavos: number; totalCupsSold: number;
   dineInCount: number; takeoutCount: number; avgRating: number | null;
   feedbackCount: number; topProduct: { name: string; sold: number } | null;
   peakHour: { hour: string; count: number } | null;
@@ -71,6 +73,13 @@ export function ReportsPage() {
   const [birPage, setBirPage] = useState(1);
   const birLimit = 10;
   const [audit, setAudit] = useState<any[]>([]);
+  const [auditSearch, setAuditSearch] = useState("");
+  const [auditActionFilter, setAuditActionFilter] = useState("all");
+  const [auditUserFilter, setAuditUserFilter] = useState("all");
+  const [auditOrderFilter, setAuditOrderFilter] = useState<"all" | "order_processed" | "non_order">("all");
+  const [auditTicketDetail, setAuditTicketDetail] = useState<any | null>(null);
+  const [auditTicketLoading, setAuditTicketLoading] = useState(false);
+  const [auditTicketError, setAuditTicketError] = useState<string | null>(null);
   const [kpi, setKpi] = useState<Kpi | null>(null);
   const [demographics, setDemographics] = useState<any[]>([]);
   const [orderTypes, setOrderTypes] = useState<any[]>([]);
@@ -90,8 +99,40 @@ export function ReportsPage() {
     api<Record<string, unknown>>(`/reports/bir?x=1${dq}`).then(r => { setBirData(r); setBirPage(1); }).catch(() => setBirData(null));
   }
   function refreshAudit() {
-    api<{ events: any[] }>("/audit?limit=200").then(r => setAudit(r.events ?? [])).catch(() => setAudit([]));
+    const dq = buildDateQ();
+    api<{ events: any[] }>(`/audit?limit=200${dq}`).then(r => setAudit(r.events ?? [])).catch(() => setAudit([]));
   }
+  const auditActions = useMemo(
+    () => Array.from(new Set(audit.map((ev) => String(ev.action ?? "")).filter(Boolean))).sort(),
+    [audit],
+  );
+  const auditUsers = useMemo(
+    () => Array.from(new Set(audit.map((ev) => String(ev.user_name ?? "System")))).sort(),
+    [audit],
+  );
+  const filteredAudit = useMemo(() => {
+    const q = auditSearch.trim().toLowerCase();
+    return audit.filter((ev) => {
+      const isOrderProcessed = ev.action === "ticket.create";
+      if (auditOrderFilter === "order_processed" && !isOrderProcessed) return false;
+      if (auditOrderFilter === "non_order" && isOrderProcessed) return false;
+      if (auditActionFilter !== "all" && String(ev.action) !== auditActionFilter) return false;
+      if (auditUserFilter !== "all" && String(ev.user_name ?? "System") !== auditUserFilter) return false;
+      if (!q) return true;
+      const haystack = [
+        ev.action,
+        ev.entity_type,
+        ev.entity_id,
+        ev.ticket_no,
+        ev.ticket_no ? `#${String(ev.ticket_no).padStart(4, "0")}` : "",
+        ev.user_name ?? "System",
+        new Date(String(ev.created_at)).toLocaleString(),
+      ]
+        .map((v) => String(v ?? "").toLowerCase())
+        .join(" ");
+      return haystack.includes(q);
+    });
+  }, [audit, auditSearch, auditActionFilter, auditUserFilter, auditOrderFilter]);
   function refreshAnalytics() {
     const dq = buildDateQ();
     api<Kpi>(`/analytics/kpi?x=1${demoQ}${dq}`).then(setKpi).catch(() => setKpi(null));
@@ -134,6 +175,197 @@ export function ReportsPage() {
     alert("Feedback saved!");
   }
 
+  async function handleVoid(ticketId: string) {
+    const reason = window.prompt("Void entire ticket? Type reason:");
+    if (!reason) return;
+    try {
+      await api(`/tickets/${ticketId}/void-ticket`, { method: "POST", json: { reason } });
+      refreshAudit();
+      alert("Ticket voided successfully.");
+    } catch (e: any) {
+      alert("Failed to void ticket: " + e.message);
+    }
+  }
+
+  async function handleRefund(ticketId: string) {
+    const pesosStr = window.prompt("Refund Amount (PHP):");
+    if (!pesosStr) return;
+    const pesos = Number(pesosStr);
+    if (isNaN(pesos) || pesos <= 0) {
+      alert("Invalid amount.");
+      return;
+    }
+    const reason = window.prompt("Refund Reason:") || "Customer request";
+    try {
+      await api(`/tickets/${ticketId}/refunds`, {
+        method: "POST",
+        json: { amountCentavos: Math.round(pesos * 100), reason, note: "Refunded from Audit log" }
+      });
+      refreshAudit();
+      alert("Refund recorded successfully.");
+    } catch (e: any) {
+      alert("Failed to refund: " + e.message);
+    }
+  }
+
+  async function openTicketDetail(ticketId: string) {
+    setAuditTicketLoading(true);
+    setAuditTicketError(null);
+    setAuditTicketDetail(null);
+    try {
+      const detail = await api<{
+        ticket: { id: string; ticket_no?: number | null; created_at?: string | null };
+        textReceipt: string;
+        htmlReceipt?: string;
+        mailtoUrl?: string;
+      }>(`/tickets/${ticketId}/receipt`);
+      setAuditTicketDetail(detail);
+    } catch (err: any) {
+      setAuditTicketError(err?.message ?? "Failed to load ticket receipt");
+    } finally {
+      setAuditTicketLoading(false);
+    }
+  }
+
+  async function downloadIncomeSummaryXlsx() {
+    if (!eodData) {
+      alert("No data available to export.");
+      return;
+    }
+    
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("Income Summary");
+    
+    ws.columns = [
+      { header: "Metric", key: "metric", width: 35 },
+      { header: "Value", key: "value", width: 20 },
+    ];
+    
+    ws.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
+    ws.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4F81BD" } };
+
+    const c = (val: any) => (Number(val) || 0) / 100;
+    
+    const data = [
+      { metric: "Gross Sales", value: c(eodData.grossSalesCentavos) },
+      { metric: "Less: Discounts", value: -c(eodData.discountsCentavos) },
+      { metric: "Less: Marketing Expense", value: -c(eodData.marketingExpenseCentavos) },
+      { metric: "Total Discounts", value: -c(eodData.totalDiscountsCentavos) },
+      { metric: "Net Sales", value: c(eodData.netSalesCentavos) },
+      { metric: "Less: Refunds / Returns", value: -c(eodData.refundsCentavos) },
+      { metric: "Adjusted Net Revenue", value: c(eodData.adjustedNetCentavos) },
+      { metric: "Adjusted Net After Marketing", value: c(eodData.adjustedAfterMarketingCentavos) },
+      {},
+      { metric: "VATable Sales (excl. VAT)", value: c(eodData.vatableSalesCentavos) },
+      { metric: "Output VAT 12%", value: c(eodData.taxCollectedCentavos) },
+      { metric: "VAT-Exempt Sales", value: 0 },
+      { metric: "Zero-Rated Sales", value: 0 },
+      {},
+      { metric: "Cash", value: c(eodData.cashCentavos) },
+      { metric: "E-Wallet", value: c(eodData.ewalletCentavos) },
+      { metric: "Total Collected", value: c(eodData.totalCollectedCentavos) },
+      {},
+      { metric: "Total Tickets", value: Number(eodData.totalTickets) || 0, isCount: true },
+      { metric: "Dine-in", value: Number(eodData.dineInCount) || 0, isCount: true },
+      { metric: "Takeout", value: Number(eodData.takeoutCount) || 0, isCount: true },
+      { metric: "Void Lines", value: Number(eodData.voidLineCount) || 0, isCount: true },
+      { metric: "Marketing Freebie Tickets", value: Number(eodData.marketingTicketCount) || 0, isCount: true },
+    ];
+    
+    data.forEach(row => {
+      const addedRow = ws.addRow(row);
+      if (row.metric) {
+        if (!row.isCount) {
+          addedRow.getCell('value').numFmt = '₱#,##0.00;[Red]-₱#,##0.00';
+        } else {
+          addedRow.getCell('value').numFmt = '#,##0';
+        }
+        if (["Gross Sales", "Net Sales", "Adjusted Net Revenue", "Total Collected"].includes(row.metric as string)) {
+          addedRow.font = { bold: true };
+          if (row.metric === "Total Collected" || row.metric === "Adjusted Net Revenue" || row.metric === "Net Sales") {
+            addedRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F2F2' } };
+          }
+        }
+      }
+    });
+
+    const buf = await wb.xlsx.writeBuffer();
+    saveAs(new Blob([buf]), `Income_Summary_${activeDateLabel || "Today"}.xlsx`);
+  }
+
+  async function downloadBirXlsx() {
+    if (!birData || !birData.transactions || !birData.summary) {
+      alert("No data available to export.");
+      return;
+    }
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("BIR Report");
+    
+    const s = birData.summary as any;
+    const c = (val: any) => (Number(val) || 0) / 100;
+    
+    ws.getColumn('A').width = 25;
+    ws.getColumn('B').width = 20;
+
+    ws.addRow(["BIR Summary", ""]);
+    ws.getRow(1).font = { bold: true, size: 14, color: { argb: "FFFFFFFF" } };
+    ws.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4F81BD" } };
+    ws.mergeCells('A1:B1');
+
+    const summaryRows = [
+      { label: "Total Transactions", value: Number(s.totalTransactions) || 0, isCount: true },
+      { label: "Gross Sales", value: c(s.grossSalesCentavos) },
+      { label: "Discounts", value: c(s.discountOnlyCentavos ?? s.discountsCentavos) },
+      { label: "Marketing Expense", value: c(s.marketingExpenseCentavos) },
+      { label: "Total Discounts", value: c(s.totalDiscountsCentavos ?? s.discountsCentavos) },
+      { label: "Net Sales", value: c(s.netSalesCentavos) },
+      { label: "VATable Sales", value: c(s.vatableSalesCentavos) },
+      { label: "Output VAT 12%", value: c(s.vatCollectedCentavos) },
+      { label: "VAT-Exempt", value: 0 },
+      { label: "Zero-Rated", value: 0 },
+    ];
+    
+    summaryRows.forEach(row => {
+      const addedRow = ws.addRow([row.label, row.value]);
+      if (row.isCount) {
+        addedRow.getCell(2).numFmt = '#,##0';
+      } else {
+        addedRow.getCell(2).numFmt = '₱#,##0.00;[Red]-₱#,##0.00';
+      }
+      if (["Gross Sales", "Net Sales", "Total Transactions"].includes(row.label)) {
+        addedRow.font = { bold: true };
+        addedRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F2F2' } };
+      }
+    });
+
+    ws.addRow([]);
+    ws.addRow([]);
+
+    const txHeaderRow = ws.addRow(["No.", "OR/Ticket", "Date", "Time", "Type", "Gross", "Discount", "Net Sales", "Vatable", "VAT 12%", "Total"]);
+    txHeaderRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    txHeaderRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF00B050" } };
+    
+    const widths = [8, 15, 12, 10, 10, 12, 12, 12, 12, 12, 12];
+    widths.forEach((w, i) => {
+      ws.getColumn(i + 1).width = Math.max(ws.getColumn(i + 1).width || 0, w);
+    });
+
+    const txs = birData.transactions as any[];
+    txs.forEach((r: any) => {
+      const addedRow = ws.addRow([
+        r.no, r.ticketId, r.date, r.time, r.type,
+        c(r.grossAmount), c(r.discount), c(r.netAmount),
+        c(r.vatableSales), c(r.vatAmount), c(r.totalAmount)
+      ]);
+      [6, 7, 8, 9, 10, 11].forEach(colIdx => {
+        addedRow.getCell(colIdx).numFmt = '₱#,##0.00;[Red]-₱#,##0.00';
+      });
+    });
+
+    const buf = await wb.xlsx.writeBuffer();
+    saveAs(new Blob([buf]), `BIR_Report_${activeDateLabel || "Today"}.xlsx`);
+  }
+
   const ct = { grid: "var(--border)", axis: "var(--muted)", bg: "var(--panel)" };
 
   return (
@@ -171,12 +403,12 @@ export function ReportsPage() {
                 <button type="button" className={birView ? "primary-btn" : "ghost-btn"} onClick={() => setBirView(true)}>BIR Report</button>
               </div>
               <div className="row" style={{ gap: 8 }}>
-                <a className="ghost-btn" href={`/api/reports/export.csv?x=1${buildDateQ()}`} style={{ textDecoration: "none" }}>
-                  <span>⬇</span> CSV
-                </a>
-                <a className="ghost-btn" href={`/api/reports/bir.csv?x=1${buildDateQ()}`} style={{ textDecoration: "none" }}>
-                  <span>⬇</span> BIR CSV
-                </a>
+                <button type="button" className="ghost-btn" onClick={downloadIncomeSummaryXlsx}>
+                  <span>⬇</span> XLSX
+                </button>
+                <button type="button" className="ghost-btn" onClick={downloadBirXlsx}>
+                  <span>⬇</span> BIR XLSX
+                </button>
                 <button type="button" className="ghost-btn" onClick={() => {
                   const el = document.getElementById("printable-report");
                   if (!el) return;
@@ -207,9 +439,12 @@ export function ReportsPage() {
                     {[
                       ["Gross Sales", Number(eodData?.grossSalesCentavos ?? 0), false, false],
                       ["Less: Discounts", -Number(eodData?.discountsCentavos ?? 0), false, false],
+                      ["Less: Marketing Expense", -Number(eodData?.marketingExpenseCentavos ?? 0), false, false],
+                      ["Total Discounts", -Number(eodData?.totalDiscountsCentavos ?? 0), false, false],
                       ["Net Sales", Number(eodData?.netSalesCentavos ?? 0), true, false],
                       ["Less: Refunds / Returns", -Number(eodData?.refundsCentavos ?? 0), false, false],
-                      ["Adjusted Net Revenue", Number(eodData?.adjustedNetCentavos ?? 0), true, true],
+                      ["Adjusted Net Revenue", Number(eodData?.adjustedNetCentavos ?? 0), true, false],
+                      ["Adjusted Net After Marketing", Number(eodData?.adjustedAfterMarketingCentavos ?? 0), true, true],
                     ].map(([label, val, sep, bold]) => (
                       <div key={String(label)} className="row" style={{ justifyContent: "space-between", padding: "8px 0", borderBottom: sep ? "2px solid var(--border)" : "1px solid var(--border)", marginBottom: sep ? 6 : 0 }}>
                         <span style={{ fontSize: 13, color: "var(--muted)" }}>{String(label)}</span>
@@ -219,6 +454,10 @@ export function ReportsPage() {
                     <div className="row" style={{ justifyContent: "space-between", padding: "6px 0", marginTop: 8 }}>
                       <span className="muted" style={{ fontSize: 12 }}>Void Lines</span>
                       <span style={{ fontSize: 13, fontWeight: 600 }}>{String(eodData?.voidLineCount ?? 0)}</span>
+                    </div>
+                    <div className="row" style={{ justifyContent: "space-between", padding: "6px 0" }}>
+                      <span className="muted" style={{ fontSize: 12 }}>Marketing Freebie Tickets</span>
+                      <span style={{ fontSize: 13, fontWeight: 600 }}>{String(eodData?.marketingTicketCount ?? 0)}</span>
                     </div>
                   </div>
 
@@ -279,7 +518,9 @@ export function ReportsPage() {
                     {(() => { const s = birData?.summary as any; return s && ([
                       ["Total Transactions", String(s.totalTransactions)],
                       ["Gross Sales", formatPhp(Number(s.grossSalesCentavos))],
-                      ["Total Discounts", formatPhp(Number(s.discountsCentavos))],
+                      ["Discounts", formatPhp(Number(s.discountOnlyCentavos ?? s.discountsCentavos ?? 0))],
+                      ["Marketing Expense", formatPhp(Number(s.marketingExpenseCentavos ?? 0))],
+                      ["Total Discounts", formatPhp(Number(s.totalDiscountsCentavos ?? s.discountsCentavos ?? 0))],
                       ["Net Sales", formatPhp(Number(s.netSalesCentavos))],
                       ["VATable Sales", formatPhp(Number(s.vatableSalesCentavos))],
                       ["Output VAT 12%", formatPhp(Number(s.vatCollectedCentavos))],
@@ -392,6 +633,7 @@ export function ReportsPage() {
             {kpi && (
               <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
                 <KpiCard label="Total Orders" value={kpi.totalTickets.toLocaleString()} sub={demo ? DEMOGRAPHICS.find(d=>d.value===demo)?.label : "All profiles"} />
+                <KpiCard label="Total Cups Sold" value={kpi.totalCupsSold.toLocaleString()} sub="Items sold" />
                 <KpiCard label="Total Revenue" value={formatPhp(kpi.totalRevenueCentavos)} sub="Completed payments" />
                 <KpiCard label="Avg Order Value" value={formatPhp(kpi.avgOrderValueCentavos)} sub="Per ticket" />
                 <KpiCard label="Avg Rating" value={kpi.avgRating != null ? `★ ${Number(kpi.avgRating).toFixed(1)}` : "—"} sub={`${kpi.feedbackCount} reviews`} />
@@ -625,98 +867,127 @@ export function ReportsPage() {
                   </div>
                 </div>
 
-                {/* 7-Day Forecast Chart */}
-                {forecast.forecasts && forecast.forecasts.length > 0 && (
-                  <div className="card stack" style={{ gap: 12 }}>
-                    <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>7-Day Forecast</h3>
-                    <div className="muted" style={{ fontSize: 12 }}>Predicted daily order volume</div>
-                    <ResponsiveContainer width="100%" height={250}>
-                      <BarChart 
-                        data={forecast.forecasts.map((f: any) => ({
-                          date: new Date(f.date).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
-                          units: f.totalForecastedUnits,
-                          fullDate: f.date,
-                        }))}
-                        margin={{ top: 0, right: 8, bottom: 0, left: -10 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} />
-                        <XAxis dataKey="date" stroke={ct.axis} tick={{ fontSize: 10 }} />
-                        <YAxis stroke={ct.axis} tick={{ fontSize: 10 }} />
-                        <Tooltip 
-                          contentStyle={{ backgroundColor: ct.bg, border: `1px solid ${ct.grid}`, borderRadius: 10, color: "var(--text)", fontSize: 12 }}
-                          formatter={(v: any) => [`${v} units`, "Forecasted"]}
-                          labelFormatter={(label) => `Forecast: ${String(label)}`}
-                        />
-                        <Bar dataKey="units" name="Forecasted Units" fill="#3b82f6" radius={[4, 4, 0, 0]} />
-                      </BarChart>
-                    </ResponsiveContainer>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(400px, 1fr))", gap: 18, alignItems: "start" }}>
+                  <div className="stack" style={{ gap: 18 }}>
+                    {/* 7-Day Forecast Chart */}
+                    {forecast.forecasts && forecast.forecasts.length > 0 && (
+                      <div className="card stack" style={{ gap: 12 }}>
+                        <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>7-Day Forecast</h3>
+                        <div className="muted" style={{ fontSize: 12 }}>Predicted daily order volume</div>
+                        <ResponsiveContainer width="100%" height={280}>
+                          <BarChart 
+                            data={forecast.forecasts.map((f: any) => ({
+                              date: new Date(f.date).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+                              units: f.totalForecastedUnits,
+                              fullDate: f.date,
+                            }))}
+                            margin={{ top: 0, right: 8, bottom: 0, left: -10 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} />
+                            <XAxis dataKey="date" stroke={ct.axis} tick={{ fontSize: 10 }} />
+                            <YAxis stroke={ct.axis} tick={{ fontSize: 10 }} />
+                            <Tooltip 
+                              contentStyle={{ backgroundColor: ct.bg, border: `1px solid ${ct.grid}`, borderRadius: 10, color: "var(--text)", fontSize: 12 }}
+                              formatter={(v: any) => [`${v} units`, "Forecasted"]}
+                              labelFormatter={(label) => `Forecast: ${String(label)}`}
+                            />
+                            <Bar dataKey="units" name="Forecasted Units" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
+
+                    {/* Product Breakdown */}
+                    {forecast.forecasts && forecast.forecasts[0]?.byProduct && (
+                      <div className="card stack" style={{ gap: 12 }}>
+                        <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>Product Forecast Breakdown</h3>
+                        <div className="muted" style={{ fontSize: 12 }}>Predicted units per product across 7 days</div>
+                        
+                        {/* Product rows */}
+                        <div className="stack" style={{ gap: 8 }}>
+                          {forecast.forecasts[0].byProduct.map((product: any, i: number) => {
+                            const total = forecast.forecasts.reduce((sum: number, day: any) => {
+                              const p = day.byProduct.find((bp: any) => bp.productName === product.productName);
+                              return sum + (p?.forecastedUnits || 0);
+                            }, 0);
+                            
+                            return (
+                              <div key={i} className="row" style={{ justifyContent: "space-between", alignItems: "center", padding: "10px 12px", background: "var(--bg)", borderRadius: 8, border: "1px solid var(--border)" }}>
+                                <div className="stack" style={{ gap: 2, flex: 1 }}>
+                                  <div style={{ fontWeight: 600, fontSize: 13, color: "var(--text)" }}>{product.productName}</div>
+                                  <div className="muted" style={{ fontSize: 10 }}>7-day total: {total} units</div>
+                                </div>
+                                <div style={{ fontSize: 16, fontWeight: 800, color: "#22c55e" }}>{total}</div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="stack" style={{ gap: 18 }}>
+                    {/* Insights */}
+                    {forecast.insights && forecast.insights.length > 0 && (
+                      <div className="card stack" style={{ gap: 12, border: "1px solid color-mix(in srgb, var(--accent) 30%, transparent)" }}>
+                        <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--accent-strong)" }}>💡 Market & Trend Insights</h3>
+                        <div className="stack" style={{ gap: 10 }}>
+                          {forecast.insights.map((insight: any, i: number) => {
+                            const colors = { trend: '#3b82f6', demographic: '#8b5cf6', season: '#eab308', calendar: '#ec4899' };
+                            const icons = { trend: '📈', demographic: '👥', season: '🌤️', calendar: '📅' };
+                            const color = colors[insight.type as keyof typeof colors] || '#3b82f6';
+                            const icon = icons[insight.type as keyof typeof icons] || '💡';
+                            return (
+                              <div key={i} style={{ padding: "14px 16px", background: "var(--bg-elevated)", borderLeft: `4px solid ${color}`, borderRadius: "4px 8px 8px 4px", borderTop: "1px solid var(--border)", borderRight: "1px solid var(--border)", borderBottom: "1px solid var(--border)", display: "flex", flexDirection: "column", gap: 6 }}>
+                                <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                                  <span style={{ fontSize: 16 }}>{icon}</span>
+                                  <div style={{ fontWeight: 700, fontSize: 13, color: "var(--text)" }}>{insight.title}</div>
+                                </div>
+                                <div className="muted" style={{ fontSize: 12, lineHeight: 1.5, paddingLeft: 24 }}>{insight.content}</div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
 
                     {/* Daily Breakdown */}
-                    <div className="stack" style={{ gap: 8, marginTop: 12 }}>
-                      {forecast.forecasts.slice(0, 7).map((day: any, i: number) => (
-                        <div key={i} className="row" style={{ justifyContent: "space-between", alignItems: "center", padding: "12px 14px", background: "var(--bg)", borderRadius: 10, border: "1px solid var(--border)" }}>
-                          <div className="stack" style={{ gap: 2, flex: 1 }}>
-                            <div style={{ fontWeight: 700, fontSize: 13, color: "var(--text)" }}>
-                              {new Date(day.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
+                    {forecast.forecasts && forecast.forecasts.length > 0 && (
+                      <div className="card stack" style={{ gap: 12 }}>
+                        <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>Daily Overview</h3>
+                        <div className="stack" style={{ gap: 8 }}>
+                          {forecast.forecasts.slice(0, 7).map((day: any, i: number) => (
+                            <div key={i} className="row" style={{ justifyContent: "space-between", alignItems: "center", padding: "12px 14px", background: "var(--bg)", borderRadius: 10, border: "1px solid var(--border)" }}>
+                              <div className="stack" style={{ gap: 2, flex: 1 }}>
+                                <div style={{ fontWeight: 700, fontSize: 13, color: "var(--text)" }}>
+                                  {new Date(day.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
+                                </div>
+                                <div className="muted" style={{ fontSize: 11 }}>
+                                  {day.byProduct.length} products
+                                </div>
+                              </div>
+                              <div className="stack" style={{ gap: 2, alignItems: "flex-end" }}>
+                                <div style={{ fontSize: 18, fontWeight: 800, color: "var(--accent-strong)" }}>
+                                  {day.totalForecastedUnits}
+                                </div>
+                                <div className="muted" style={{ fontSize: 11 }}>units</div>
+                              </div>
                             </div>
-                            <div className="muted" style={{ fontSize: 11 }}>
-                              {day.byProduct.length} products
-                            </div>
-                          </div>
-                          <div className="stack" style={{ gap: 2, alignItems: "flex-end" }}>
-                            <div style={{ fontSize: 18, fontWeight: 800, color: "var(--accent-strong)" }}>
-                              {day.totalForecastedUnits}
-                            </div>
-                            <div className="muted" style={{ fontSize: 11 }}>units</div>
-                          </div>
+                          ))}
                         </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* Product Breakdown */}
-                {forecast.forecasts && forecast.forecasts[0]?.byProduct && (
-                  <div className="card stack" style={{ gap: 12 }}>
-                    <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>Product Forecast Breakdown</h3>
-                    <div className="muted" style={{ fontSize: 12 }}>Predicted units per product across 7 days</div>
-                    
-                    {/* Product rows */}
-                    <div className="stack" style={{ gap: 8 }}>
-                      {forecast.forecasts[0].byProduct.map((product: any, i: number) => {
-                        const total = forecast.forecasts.reduce((sum: number, day: any) => {
-                          const p = day.byProduct.find((bp: any) => bp.productName === product.productName);
-                          return sum + (p?.forecastedUnits || 0);
-                        }, 0);
-                        
-                        return (
-                          <div key={i} className="row" style={{ justifyContent: "space-between", alignItems: "center", padding: "10px 12px", background: "var(--bg)", borderRadius: 8, border: "1px solid var(--border)" }}>
-                            <div className="stack" style={{ gap: 2, flex: 1 }}>
-                              <div style={{ fontWeight: 600, fontSize: 13, color: "var(--text)" }}>{product.productName}</div>
-                              <div className="muted" style={{ fontSize: 10 }}>7-day total: {total} units</div>
-                            </div>
-                            <div style={{ fontSize: 16, fontWeight: 800, color: "#22c55e" }}>{total}</div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-
-                {/* Insights */}
-                <div className="card stack" style={{ gap: 10, background: "color-mix(in srgb, var(--accent) 8%, transparent)", border: "1px solid color-mix(in srgb, var(--accent) 20%, transparent)" }}>
-                  <h3 style={{ margin: 0, fontWeight: 700, fontSize: 14, color: "var(--accent-strong)" }}>💡 Model Insights</h3>
-                  <div style={{ fontSize: 13, color: "var(--text)", lineHeight: 1.6 }}>
-                    <p style={{ margin: "0 0 8px 0" }}>
-                      This forecast is generated using <strong>{forecast.usedAI ? "advanced AI analysis" : "statistical modeling"}</strong> based on your historical sales data.
-                    </p>
-                    {forecast.usedAI && (
-                      <p style={{ margin: "0 0 8px 0" }}>
-                        The model considers weekly patterns, customer demographics, and seasonal trends to predict demand for the next week.
-                      </p>
+                      </div>
                     )}
-                    <p style={{ margin: 0, fontSize: 12, color: "var(--muted)" }}>
-                      ℹ Forecasts become more accurate as more historical data accumulates. Currently using {forecast.historicalDataPoints} data points.
-                    </p>
+
+                    {/* Generic Model Info */}
+                    <div className="card stack" style={{ gap: 10, background: "color-mix(in srgb, var(--accent) 8%, transparent)", border: "1px solid color-mix(in srgb, var(--accent) 20%, transparent)" }}>
+                      <div style={{ fontSize: 13, color: "var(--text)", lineHeight: 1.6 }}>
+                        <p style={{ margin: "0 0 8px 0" }}>
+                          This forecast is generated using <strong>{forecast.usedAI ? "advanced AI analysis" : "statistical modeling"}</strong> based on your historical sales data.
+                        </p>
+                        <p style={{ margin: 0, fontSize: 12, color: "var(--muted)" }}>
+                          ℹ Currently using {forecast.historicalDataPoints} data points for analysis.
+                        </p>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -736,8 +1007,60 @@ export function ReportsPage() {
       {tab === "audit" && (
         <div className="card stack" style={{ gap: 0, maxHeight: "75vh", overflow: "auto" }}>
           <h2 style={{ marginTop: 0, marginBottom: 16, fontWeight: 700, color: "var(--text)" }}>System Audit Logs</h2>
-          {audit.map(ev => {
-            const isPurchase = ev.action === "ticket.create";
+          <div className="row" style={{ gap: 10, flexWrap: "wrap", marginBottom: 14, alignItems: "center" }}>
+            <input
+              className="field"
+              type="search"
+              placeholder="Search action, user, receipt/ticket no, date..."
+              value={auditSearch}
+              onChange={(e) => setAuditSearch(e.target.value)}
+              style={{ flex: "1 1 200px" }}
+            />
+            <select className="field" value={auditActionFilter} onChange={(e) => setAuditActionFilter(e.target.value)} style={{ flex: "1 1 120px" }}>
+              <option value="all">All Actions</option>
+              {auditActions.map((action) => (
+                <option key={action} value={action}>{action}</option>
+              ))}
+            </select>
+            <select className="field" value={auditUserFilter} onChange={(e) => setAuditUserFilter(e.target.value)} style={{ flex: "1 1 120px" }}>
+              <option value="all">All Users</option>
+              {auditUsers.map((user) => (
+                <option key={user} value={user}>{user}</option>
+              ))}
+            </select>
+            <select className="field" value={auditOrderFilter} onChange={(e) => setAuditOrderFilter(e.target.value as "all" | "order_processed" | "non_order")} style={{ flex: "1 1 140px" }}>
+              <option value="all">All Log Types</option>
+              <option value="order_processed">Order Processed Only</option>
+              <option value="non_order">Exclude Order Processed</option>
+            </select>
+            <button type="button" className="ghost-btn" style={{ fontWeight: 600, padding: "8px 12px", border: "1px solid var(--border)" }} onClick={() => setFilterOpen(true)}>
+              📅 Date Filter
+            </button>
+            {(auditSearch || auditActionFilter !== "all" || auditUserFilter !== "all" || auditOrderFilter !== "all" || dateType !== "all") && (
+              <button
+                type="button"
+                className="ghost-btn tiny-btn"
+                onClick={() => {
+                  setAuditSearch("");
+                  setAuditActionFilter("all");
+                  setAuditUserFilter("all");
+                  setAuditOrderFilter("all");
+                  setDateType("all");
+                }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+            Showing {filteredAudit.length} of {audit.length} logs
+          </div>
+          {filteredAudit.length === 0 && (
+            <div className="muted" style={{ padding: "20px 8px" }}>No audit logs match your current filters.</div>
+          )}
+          {filteredAudit.map(ev => {
+            const isPurchase = ev.action === "ticket.create" || ev.action === "ticket.close_freebie";
+            const formattedTicketNo = ev.ticket_no ? `#${String(ev.ticket_no).padStart(4, "0")}` : null;
             return (
               <div key={String(ev.id)} className="row" style={{ fontSize: 13, borderBottom: "1px solid var(--border)", padding: "14px 12px", gap: 16, alignItems: "center", background: isPurchase ? "color-mix(in srgb, var(--ok) 5%, transparent)" : "transparent", borderRadius: isPurchase ? 8 : 0, margin: isPurchase ? "3px 0" : 0 }}>
                 <div className="muted" style={{ minWidth: 140 }}>{new Date(String(ev.created_at)).toLocaleString()}</div>
@@ -745,11 +1068,37 @@ export function ReportsPage() {
                   <strong style={{ color: "var(--ok)", fontSize: 14 }}>{String(ev.action)}</strong>
                   {ev.entity_type ? <span className="muted" style={{ marginLeft: 6 }}>· {String(ev.entity_type)}</span> : ""}
                   {isPurchase ? <span style={{ marginLeft: 8, padding: "2px 6px", background: "var(--ok)", color: "#fff", borderRadius: 4, fontSize: 10, fontWeight: 700 }}>ORDER PROCESSED</span> : null}
+                  {isPurchase && formattedTicketNo ? (
+                    <span style={{ marginLeft: 8, padding: "2px 7px", background: "var(--accent-muted)", color: "var(--accent-strong)", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid var(--accent)" }}>
+                      Ticket {formattedTicketNo}
+                    </span>
+                  ) : null}
                 </div>
-                <div className="row" style={{ gap: 10 }}>
+                <div className="row" style={{ gap: 8 }}>
                   {isPurchase && ev.entity_id && (
-                    <button type="button" className="ghost-btn tiny-btn" style={{ borderColor: "var(--accent)", color: "var(--accent-strong)" }} onClick={() => setFeedbackModalTicketId(String(ev.entity_id))}>
-                      Add Feedback
+                    <button
+                      type="button"
+                      className="ghost-btn tiny-btn"
+                      style={{ borderColor: "var(--border)", color: "var(--text)", padding: "4px 8px" }}
+                      onClick={() => void openTicketDetail(String(ev.entity_id))}
+                      title="View Ticket"
+                    >
+                      <span className="btn-icon" style={{ marginRight: 0 }}>📄</span> <span className="hide-mobile">View</span>
+                    </button>
+                  )}
+                  {isPurchase && ev.entity_id && (
+                    <button type="button" className="ghost-btn tiny-btn" style={{ borderColor: "var(--accent)", color: "var(--accent-strong)", padding: "4px 8px" }} onClick={() => setFeedbackModalTicketId(String(ev.entity_id))} title="Add Feedback">
+                      <span className="btn-icon" style={{ marginRight: 0 }}>💬</span>
+                    </button>
+                  )}
+                  {isPurchase && ev.entity_id && (
+                    <button type="button" className="ghost-btn tiny-btn" style={{ borderColor: "#f59e0b", color: "#d97706", padding: "4px 8px" }} onClick={() => void handleRefund(String(ev.entity_id))} title="Refund Ticket">
+                      <span className="btn-icon" style={{ marginRight: 0 }}>↩</span>
+                    </button>
+                  )}
+                  {isPurchase && ev.entity_id && (
+                    <button type="button" className="ghost-btn tiny-btn" style={{ borderColor: "#ef4444", color: "#ef4444", padding: "4px 8px" }} onClick={() => void handleVoid(String(ev.entity_id))} title="Void Ticket">
+                      <span className="btn-icon" style={{ marginRight: 0 }}>✕</span>
                     </button>
                   )}
                   <div className="muted" style={{ minWidth: 90, textAlign: "center", fontWeight: 600, background: "var(--bg)", padding: "4px 10px", borderRadius: 12, border: "1px solid var(--border)", fontSize: 12 }}>
@@ -871,6 +1220,90 @@ export function ReportsPage() {
                 <button type="button" className="ghost-btn" onClick={() => setFeedbackModalTicketId(null)}>Cancel</button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+      {auditTicketLoading && (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack">
+            <h2 style={{ margin: 0 }}>Ticket Details</h2>
+            <div className="muted">Loading ticket information...</div>
+            <div className="row">
+              <button type="button" className="ghost-btn" onClick={() => setAuditTicketLoading(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {(auditTicketDetail || auditTicketError) && !auditTicketLoading && (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack" style={{ maxWidth: 760 }}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+              <h2 style={{ margin: 0 }}>
+                Receipt {auditTicketDetail?.ticket?.ticket_no ? `#${String(auditTicketDetail.ticket.ticket_no).padStart(4, "0")}` : ""}
+              </h2>
+              <button type="button" className="ghost-btn tiny-btn" onClick={() => { setAuditTicketDetail(null); setAuditTicketError(null); }}>✕ Close</button>
+            </div>
+            {auditTicketError ? (
+              <div style={{ color: "#ef4444", fontSize: 13 }}>{auditTicketError}</div>
+            ) : (
+              <>
+                <div style={{ display: "grid", placeItems: "center", padding: "6px 0 2px" }}>
+                  <div
+                    style={{
+                      width: "100%",
+                      maxWidth: 430,
+                      background: "#fff",
+                      color: "#111",
+                      border: "1px solid #e5e7eb",
+                      borderRadius: 14,
+                      boxShadow: "0 14px 34px rgba(0,0,0,.12)",
+                      padding: "22px 20px",
+                    }}
+                  >
+                    <div style={{ textAlign: "center", marginBottom: 8, fontWeight: 800, fontSize: 15, letterSpacing: ".04em" }}>
+                      OFFICIAL RECEIPT
+                    </div>
+                    <div style={{ borderTop: "1px dashed #d1d5db", margin: "8px 0 10px" }} />
+                    <pre
+                      style={{
+                        margin: 0,
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                        fontFamily: "'JetBrains Mono', 'Courier New', monospace",
+                        fontSize: 12,
+                        lineHeight: 1.45,
+                        color: "#111",
+                      }}
+                    >
+                      {String(auditTicketDetail?.textReceipt ?? "")}
+                    </pre>
+                    <div style={{ borderTop: "1px dashed #d1d5db", margin: "12px 0 8px" }} />
+                    <div style={{ textAlign: "center", fontSize: 10, color: "#6b7280" }}>
+                      Generated from ticket {String(auditTicketDetail?.ticket?.id ?? "").slice(0, 8)}
+                    </div>
+                  </div>
+                </div>
+                <div className="row" style={{ justifyContent: "center", gap: 10, marginTop: 4 }}>
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    onClick={() => {
+                      const w = window.open("", "_blank");
+                      if (!w) return;
+                      w.document.write(`<!doctype html><html><head><title>Receipt</title><style>body{margin:0;padding:24px;background:#f3f4f6;font-family:system-ui} .paper{max-width:420px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:22px 20px} .title{text-align:center;font-weight:800;letter-spacing:.04em;font-size:15px} pre{white-space:pre-wrap;word-break:break-word;font:12px/1.45 'Courier New',monospace;color:#111;margin:0} .line{border-top:1px dashed #d1d5db;margin:10px 0}</style></head><body><div class="paper"><div class="title">OFFICIAL RECEIPT</div><div class="line"></div><pre>${String(auditTicketDetail?.textReceipt ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre></div></body></html>`);
+                      w.document.close();
+                      w.focus();
+                      setTimeout(() => w.print(), 250);
+                    }}
+                  >
+                    Print Receipt
+                  </button>
+                  <button type="button" className="ghost-btn" onClick={() => { setAuditTicketDetail(null); setAuditTicketError(null); }}>
+                    Close
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

@@ -16,7 +16,12 @@ database_name = "pos-db"
 database_id = "e7c76c3d-1111-4eca-b59c-f891821d4e15"
 
 [env.production]
-vars = { ENVIRONMENT = "production", ALLOWED_ORIGINS = "https://pos-api-production.arvnddl18.workers.dev" }
+vars = { ENVIRONMENT = "production", ALLOWED_ORIGINS = "https://pos-web-54h.pages.dev" }
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "pos-db"
+database_id = "e7c76c3d-1111-4eca-b59c-f891821d4e15"
 
 # [[r2_buckets]]
 # binding = "R2_BUCKET"
