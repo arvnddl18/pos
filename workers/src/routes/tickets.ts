@@ -145,13 +145,59 @@ ticketRoutes.get("/open", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
   const registerId = c.req.query("registerId");
   if (!registerId) return c.json({ error: "registerId_required" }, 400);
+  const status = c.req.query("status");
+  let statusClause = "t.status IN ('open','parked')";
+  if (status === "parked") statusClause = "t.status = 'parked'";
+  else if (status === "open") statusClause = "t.status = 'open'";
+
   const rows = await c.env.DB.prepare(
-    `SELECT id, ticket_no, status, ticket_type, parked_label, table_ref, created_at, updated_at FROM tickets
-     WHERE org_id = ? AND register_id = ? AND status IN ('open','parked') ORDER BY updated_at DESC`,
+    `SELECT t.id, t.ticket_no, t.status, t.ticket_type, t.parked_label, t.table_ref, t.created_at, t.updated_at,
+       (SELECT COUNT(*) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as line_count,
+       (SELECT COALESCE(SUM(li.qty), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as item_qty,
+       (SELECT COALESCE(SUM(li.unit_price_centavos * li.qty - li.discount_centavos), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as due_centavos
+     FROM tickets t
+     WHERE t.org_id = ? AND t.register_id = ? AND ${statusClause}
+     ORDER BY CASE WHEN t.status = 'parked' THEN 0 ELSE 1 END, t.updated_at ASC`,
   )
     .bind(auth.orgId, registerId)
     .all<Record<string, unknown>>();
   return c.json({ tickets: rows.results ?? [] });
+});
+
+ticketRoutes.get("/paid", requireAuth(), requireManager(), async (c) => {
+  const auth = c.get("auth")!;
+  const q = (c.req.query("q") ?? "").trim();
+  const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? "50")));
+  const digits = q.replace(/\D/g, "");
+  let filterClause = "";
+  const binds: (string | number)[] = [auth.orgId];
+  if (digits) {
+    filterClause = "AND CAST(t.ticket_no AS TEXT) LIKE ?";
+    binds.push(`%${digits}%`);
+  }
+  binds.push(limit);
+  const rows = await c.env.DB.prepare(
+    `SELECT t.id, t.ticket_no, t.ticket_type, t.created_at, t.updated_at,
+       (SELECT COALESCE(SUM(p.amount_centavos), 0) FROM payments p WHERE p.ticket_id = t.id AND p.status = 'completed') as paid_centavos,
+       (SELECT COALESCE(SUM(r.amount_centavos), 0) FROM refunds r WHERE r.ticket_id = t.id) as refunded_centavos
+     FROM tickets t
+     WHERE t.org_id = ? AND t.status = 'paid' ${filterClause}
+     ORDER BY t.updated_at DESC
+     LIMIT ?`,
+  )
+    .bind(...binds)
+    .all<Record<string, unknown>>();
+  const tickets = (rows.results ?? []).map((r) => ({
+    id: String(r.id),
+    ticket_no: Number(r.ticket_no ?? 0),
+    ticket_type: String(r.ticket_type ?? ""),
+    created_at: String(r.created_at ?? ""),
+    updated_at: String(r.updated_at ?? ""),
+    paid_centavos: Number(r.paid_centavos ?? 0),
+    refunded_centavos: Number(r.refunded_centavos ?? 0),
+    refundable_centavos: Math.max(0, Number(r.paid_centavos ?? 0) - Number(r.refunded_centavos ?? 0)),
+  }));
+  return c.json({ tickets: tickets.filter((t) => t.refundable_centavos > 0) });
 });
 
 ticketRoutes.get("/:id/receipt", requireAuth(), async (c) => {
@@ -206,16 +252,49 @@ ticketRoutes.patch("/:id/adjustments", requireAuth(), async (c) => {
 ticketRoutes.patch("/:id/park", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
   const ticketId = c.req.param("id");
-  const Body = z.object({ parkedLabel: z.string().max(100).optional() });
+  const Body = z.object({ parkedLabel: z.string().min(1).max(100) });
   const body = Body.parse(await c.req.json());
   const now = new Date().toISOString();
   const res = await c.env.DB.prepare(
-    `UPDATE tickets SET status = 'parked', parked_label = COALESCE(?, parked_label), updated_at = ? WHERE id = ? AND org_id = ? AND status IN ('open','parked')`,
+    `UPDATE tickets SET status = 'parked', parked_label = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status = 'open'`,
   )
-    .bind(body.parkedLabel ?? null, now, ticketId, auth.orgId)
+    .bind(body.parkedLabel, now, ticketId, auth.orgId)
     .run();
   if (!res.success || res.meta.changes === 0) return c.json({ error: "not_found" }, 404);
+  await writeAudit({
+    db: c.env.DB,
+    orgId: auth.orgId,
+    userId: auth.id,
+    action: "ticket.parked",
+    entityType: "ticket",
+    entityId: ticketId,
+    payload: { parkedLabel: body.parkedLabel ?? null },
+  });
   return c.json({ ok: true });
+});
+
+ticketRoutes.patch("/:id/resume", requireAuth(), async (c) => {
+  const auth = c.get("auth")!;
+  const ticketId = c.req.param("id");
+  const now = new Date().toISOString();
+  const res = await c.env.DB.prepare(
+    `UPDATE tickets SET status = 'open', updated_at = ? WHERE id = ? AND org_id = ? AND status = 'parked'`,
+  )
+    .bind(now, ticketId, auth.orgId)
+    .run();
+  if (!res.success || res.meta.changes === 0) return c.json({ error: "not_found" }, 404);
+  await writeAudit({
+    db: c.env.DB,
+    orgId: auth.orgId,
+    userId: auth.id,
+    action: "ticket.resumed",
+    entityType: "ticket",
+    entityId: ticketId,
+    payload: {},
+  });
+  const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
+  if (!payload) return c.json({ error: "not_found" }, 404);
+  return c.json({ ok: true, ...payload });
 });
 
 ticketRoutes.patch("/:id/type", requireAuth(), async (c) => {
@@ -309,6 +388,7 @@ ticketRoutes.post("/:id/void-ticket", requireAuth(), requireManager(), async (c)
     orgId: auth.orgId,
     userId: auth.id,
     action: "ticket.void",
+    entityType: "ticket",
     entityId: ticketId,
     payload: body,
   });

@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { api, formatPhp } from "../api.js";
 
 type Product = Record<string, unknown>;
-type Category = { id: string; name: string; sort_order: number };
+type Category = { id: string; name: string; sort_order: number; product_kind?: string };
 type TaxProfile = { id: string; name: string; rate_bps: number };
 type ModGroup = { id: string; name: string; required: number; min_select: number; max_select: number; exclusive: number };
 type Modifier = { id: string; modifier_group_id: string; name: string; price_adjust_centavos: number; sort_order: number };
@@ -248,7 +248,14 @@ export function AdminPage() {
     setMsg(null);
     const fd = new FormData(e.currentTarget);
     try {
-      await api("/catalog/categories", { method: "POST", json: { name: String(fd.get("name")), sortOrder: Number(fd.get("sort") ?? 0) } });
+      await api("/catalog/categories", {
+        method: "POST",
+        json: {
+          name: String(fd.get("name")),
+          sortOrder: Number(fd.get("sort") ?? 0),
+          productKind: String(fd.get("productKind") ?? "cup") === "item" ? "item" : "cup",
+        },
+      });
       e.currentTarget.reset();
       setShowAddCategory(false);
       setMsg("Category created");
@@ -262,7 +269,13 @@ export function AdminPage() {
     if (!name || !name.trim()) return;
     const sortRaw = window.prompt("Sort order", String(category.sort_order));
     if (sortRaw === null) return;
-    await api(`/catalog/categories/${category.id}`, { method: "PATCH", json: { name: name.trim(), sortOrder: Number(sortRaw) || 0 } });
+    const kindRaw = window.prompt("Type: cup (drinks) or item (food)", category.product_kind ?? "cup");
+    if (kindRaw === null) return;
+    const productKind = kindRaw.trim().toLowerCase() === "item" ? "item" : "cup";
+    await api(`/catalog/categories/${category.id}`, {
+      method: "PATCH",
+      json: { name: name.trim(), sortOrder: Number(sortRaw) || 0, productKind },
+    });
     setMsg("Category updated");
   }
 
@@ -540,6 +553,7 @@ export function AdminPage() {
               <thead>
                 <tr>
                   <th>Name</th>
+                  <th>Type</th>
                   <th>Sort</th>
                   <th>Actions</th>
                 </tr>
@@ -548,6 +562,7 @@ export function AdminPage() {
                 {pageRows(categories, categoryPage).map((c) => (
                   <tr key={c.id}>
                     <td>{c.name}</td>
+                    <td>{c.product_kind === "item" ? "Food / item" : "Cup (drink)"}</td>
                     <td>{c.sort_order}</td>
                     <td>
                       <div className="row admin-table-actions">
@@ -1012,6 +1027,11 @@ export function AdminPage() {
             </div>
             <form className="stack" onSubmit={createCategory}>
               <input className="field" name="name" required placeholder="Category name" />
+              <div className="label">Product type</div>
+              <select className="field" name="productKind" defaultValue="cup">
+                <option value="cup">Cup — drinks (latte, coffee, etc.)</option>
+                <option value="item">Item — food (scrolls, snacks, etc.)</option>
+              </select>
               <input className="field" name="sort" type="number" defaultValue={0} placeholder="Sort order" />
               <button className="primary-btn" type="submit">
                 <span className="btn-icon">＋</span>

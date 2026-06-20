@@ -92,6 +92,46 @@ type PosDetail = {
   modifiersByGroup: Record<string, { id: string; name: string; price_adjust_centavos: number }[]>;
 };
 
+type ParkedTicketRow = {
+  id: string;
+  ticket_no?: number | null;
+  parked_label?: string | null;
+  ticket_type?: string | null;
+  updated_at?: string;
+  line_count?: number;
+  item_qty?: number;
+  due_centavos?: number;
+};
+
+type PaidTicketRow = {
+  id: string;
+  ticket_no: number;
+  ticket_type: string;
+  created_at: string;
+  updated_at: string;
+  paid_centavos: number;
+  refunded_centavos: number;
+  refundable_centavos: number;
+};
+
+function formatParkedWhen(iso: string | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const mins = Math.round((Date.now() - d.getTime()) / 60_000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+const RELOAD_PARK_LABEL = "parked";
+
+function activeTicketStorageKey(registerId: string) {
+  return `posActiveTicketId:${registerId}`;
+}
+
 function isManager(role: string) {
   return role === "manager" || role === "owner";
 }
@@ -124,7 +164,16 @@ export function PosPage() {
   const [cashReceiptDetail, setCashReceiptDetail] = useState<any | null>(null);
   const [cashReceiptLoading, setCashReceiptLoading] = useState(false);
   const [cashReceiptError, setCashReceiptError] = useState<string | null>(null);
-  const [refundOpen, setRefundOpen] = useState(false);
+  const [parkedTickets, setParkedTickets] = useState<ParkedTicketRow[]>([]);
+  const [parkModalOpen, setParkModalOpen] = useState(false);
+  const [parkLabel, setParkLabel] = useState("");
+  const [parkBusy, setParkBusy] = useState(false);
+  const [refundPickerOpen, setRefundPickerOpen] = useState(false);
+  const [paidTicketsForRefund, setPaidTicketsForRefund] = useState<PaidTicketRow[]>([]);
+  const [refundSearch, setRefundSearch] = useState("");
+  const [refundSelected, setRefundSelected] = useState<PaidTicketRow | null>(null);
+  const [refundBusy, setRefundBusy] = useState(false);
+  const deferredRefundSearch = useDeferredValue(refundSearch);
   const [cashPesosInput, setCashPesosInput] = useState("");
   const [me, setMe] = useState<{ role: string } | null>(null);
   const [modifierFlow, setModifierFlow] = useState<{ product: Product; detail: PosDetail } | null>(null);
@@ -223,6 +272,17 @@ export function PosPage() {
     }
   }
 
+  function publishAnalyticsUpdate() {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(new CustomEvent("pos:analytics-changed"));
+    window.dispatchEvent(new CustomEvent("pos:data-changed"));
+    if (typeof BroadcastChannel !== "undefined") {
+      const channel = new BroadcastChannel("pos-live");
+      channel.postMessage({ type: "analytics:refresh", at: Date.now() });
+      channel.close();
+    }
+  }
+
   function formatTicketLabel(id: string | null, number: number | null) {
     if (number && number > 0) return `#${String(number).padStart(4, "0")}`;
     return id ? id.slice(0, 8) : "—";
@@ -242,6 +302,9 @@ export function PosPage() {
     setTotals(res.totals ?? null);
     setDemographicColor(res.ticket.demographic_color ?? null);
     if (res.ticket.status === "paid") {
+      publishAnalyticsUpdate();
+      publishKdsUpdate("ticket_paid");
+      if (registerId) sessionStorage.removeItem(activeTicketStorageKey(registerId));
       setTicketId(null);
       setTicketNumber(null);
       setSelectedTicketType(null);
@@ -251,17 +314,30 @@ export function PosPage() {
       setTotals(null);
       setDemographicColor(null);
     }
-  }, []);
+  }, [registerId]);
 
   const refreshTicket = useCallback(async (id: string) => {
     const res = await api<{
       lineItems: LineItem[];
       payments: PaymentRow[];
-      ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null; customer_id?: string | null; feedback_rating?: number | null; feedback_notes?: string | null };
+      ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null; customer_id?: string | null; feedback_rating?: number | null; feedback_notes?: string | null; parked_label?: string | null };
       totals: Totals;
     }>(`/tickets/${id}`);
     updateTicketState(res);
   }, [updateTicketState]);
+
+  const loadParkedTickets = useCallback(async () => {
+    if (!registerId) {
+      setParkedTickets([]);
+      return;
+    }
+    try {
+      const res = await api<{ tickets: ParkedTicketRow[] }>(`/tickets/open?registerId=${encodeURIComponent(registerId)}&status=parked`);
+      setParkedTickets(res.tickets ?? []);
+    } catch {
+      setParkedTickets([]);
+    }
+  }, [registerId]);
 
   useEffect(() => {
     if (!ticketId) {
@@ -350,7 +426,63 @@ export function PosPage() {
 
   useEffect(() => {
     if (registerId) sessionStorage.setItem("registerId", registerId);
-  }, [registerId]);
+    void loadParkedTickets();
+  }, [registerId, loadParkedTickets]);
+
+  useEffect(() => {
+    if (!registerId || !ticketId || ticketStatus !== "open") return;
+    sessionStorage.setItem(activeTicketStorageKey(registerId), ticketId);
+  }, [ticketId, ticketStatus, registerId]);
+
+  useEffect(() => {
+    if (!registerId || bootLoading) return;
+    let cancelled = false;
+    async function autoParkTicketAfterReload() {
+      const storedId = sessionStorage.getItem(activeTicketStorageKey(registerId));
+      if (!storedId) return;
+      sessionStorage.removeItem(activeTicketStorageKey(registerId));
+      try {
+        const res = await api<{ ticket: { status: string } }>(`/tickets/${storedId}`);
+        if (cancelled) return;
+        if (res.ticket?.status === "open") {
+          await api(`/tickets/${storedId}/park`, {
+            method: "PATCH",
+            json: { parkedLabel: RELOAD_PARK_LABEL },
+          });
+          publishKdsUpdate("ticket_parked_reload");
+        }
+      } catch {
+        /* ticket may already be closed or missing */
+      } finally {
+        if (!cancelled) {
+          clearActiveTicket();
+          await loadParkedTickets();
+        }
+      }
+    }
+    void autoParkTicketAfterReload();
+    return () => {
+      cancelled = true;
+    };
+  }, [registerId, bootLoading, loadParkedTickets]);
+
+  useEffect(() => {
+    if (!registerId) return;
+    const refresh = () => {
+      void loadParkedTickets();
+    };
+    window.addEventListener("pos:data-changed", refresh);
+    const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("pos-live") : null;
+    channel?.addEventListener("message", (ev: MessageEvent) => {
+      if (ev.data?.type === "kds:refresh" || ev.data?.type === "analytics:refresh") refresh();
+    });
+    const intervalId = window.setInterval(refresh, 15_000);
+    return () => {
+      window.removeEventListener("pos:data-changed", refresh);
+      channel?.close();
+      window.clearInterval(intervalId);
+    };
+  }, [registerId, loadParkedTickets]);
 
   const filtered = useMemo(() => {
     const q = deferredSearch.trim().toLowerCase();
@@ -381,6 +513,7 @@ export function PosPage() {
     setTicketNumber(Number(created.ticketNo ?? 0) || null);
     setSelectedTicketType(ticketTypeForCreate);
     setTicketStatus("open");
+    sessionStorage.setItem(activeTicketStorageKey(registerId), created.id);
     return created.id;
   }
 
@@ -585,15 +718,42 @@ export function PosPage() {
     }
   }
 
-  async function parkTicket() {
-    if (!ticketId) return;
-    await api(`/tickets/${ticketId}/park`, { method: "PATCH", json: {} });
-    await refreshTicket(ticketId);
-    publishKdsUpdate("ticket_parked");
-    setNotice("Ticket parked");
+  function openParkModal() {
+    if (!ticketId || lines.length === 0) {
+      setError("Add at least one item before parking a ticket.");
+      return;
+    }
+    setParkLabel("");
+    setParkModalOpen(true);
+    setError(null);
   }
 
-  function newTicket() {
+  async function confirmParkTicket(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!ticketId) return;
+    const label = parkLabel.trim();
+    if (!label) {
+      setError("Enter a customer name or identifier.");
+      return;
+    }
+    setParkBusy(true);
+    setError(null);
+    try {
+      await api(`/tickets/${ticketId}/park`, { method: "PATCH", json: { parkedLabel: label } });
+      publishKdsUpdate("ticket_parked");
+      setParkModalOpen(false);
+      setParkLabel("");
+      clearActiveTicket();
+      await loadParkedTickets();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to park ticket.");
+    } finally {
+      setParkBusy(false);
+    }
+  }
+
+  function clearActiveTicket() {
+    if (registerId) sessionStorage.removeItem(activeTicketStorageKey(registerId));
     setTicketId(null);
     setTicketNumber(null);
     setSelectedTicketType(null);
@@ -601,6 +761,42 @@ export function PosPage() {
     setPayments([]);
     setTicketStatus("");
     setTotals(null);
+    setDemographicColor(null);
+    setDemographicExpanded(true);
+  }
+
+  async function resumeParkedTicket(row: ParkedTicketRow) {
+    if (ticketId && ticketStatus === "open" && lines.length > 0 && ticketId !== row.id) {
+      setError("Park or complete the current ticket before opening a parked order.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api<{
+        lineItems: LineItem[];
+        payments: PaymentRow[];
+        ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null };
+        totals: Totals;
+      }>(`/tickets/${row.id}/resume`, { method: "PATCH", json: {} });
+      setTicketId(row.id);
+      updateTicketState(res);
+      publishKdsUpdate("ticket_resumed");
+      setParkModalOpen(false);
+      await loadParkedTickets();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to resume parked ticket.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function parkTicket() {
+    openParkModal();
+  }
+
+  function newTicket() {
+    clearActiveTicket();
     setNotice("Ready for new ticket");
   }
 
@@ -745,10 +941,11 @@ export function PosPage() {
     const seq = ++lastRequestSeq.current;
     try {
       const res = await api<any>(`/tickets/${ticketId}/lines/${li.id}/void`, { method: "POST", json: { reason } });
-      if (seq === lastRequestSeq.current) {
-        updateTicketState(res);
-        setNotice("Line voided");
-      }
+        if (seq === lastRequestSeq.current) {
+          updateTicketState(res);
+          publishKdsUpdate("line_voided");
+          setNotice("Line voided");
+        }
     } catch (err) {
       if (seq === lastRequestSeq.current) {
         refreshTicket(ticketId);
@@ -777,6 +974,7 @@ export function PosPage() {
         const res = await api<any>(`/tickets/${ticketId}/lines/${lineItem.id}`, { method: "DELETE", json: {} });
         if (seq === lastRequestSeq.current) {
           updateTicketState(res);
+          publishKdsUpdate("line_removed");
           setNotice(`${lineItem.product_name ?? "Item"} removed`);
         }
       } else {
@@ -786,6 +984,7 @@ export function PosPage() {
         });
         if (seq === lastRequestSeq.current) {
           updateTicketState(res);
+          publishKdsUpdate("line_updated");
           setNotice(`${lineItem.product_name ?? "Item"} updated`);
         }
       }
@@ -822,6 +1021,7 @@ export function PosPage() {
       });
       if (seq === lastRequestSeq.current) {
         updateTicketState(res);
+        publishKdsUpdate("line_updated");
         setNotice(nextFreebie ? `${lineItem.product_name ?? "Item"} marked as freebie` : `${lineItem.product_name ?? "Item"} freebie removed`);
       }
     } catch (err) {
@@ -832,6 +1032,74 @@ export function PosPage() {
     }
   }
 
+  async function loadPaidTicketsForRefund(query = "") {
+    const q = query.trim();
+    const qs = q ? `&q=${encodeURIComponent(q)}` : "";
+    const res = await api<{ tickets: PaidTicketRow[] }>(`/tickets/paid?limit=50${qs}`);
+    setPaidTicketsForRefund(res.tickets ?? []);
+  }
+
+  function openRefundPicker() {
+    setRefundPickerOpen(true);
+    setRefundSelected(null);
+    setRefundSearch("");
+    void loadPaidTicketsForRefund().catch(() => {
+      setPaidTicketsForRefund([]);
+      setError("Failed to load paid tickets.");
+    });
+  }
+
+  function closeRefundPicker() {
+    setRefundPickerOpen(false);
+    setRefundSelected(null);
+    setRefundSearch("");
+    setPaidTicketsForRefund([]);
+  }
+
+  useEffect(() => {
+    if (!refundPickerOpen || refundSelected) return;
+    const handle = window.setTimeout(() => {
+      void loadPaidTicketsForRefund(deferredRefundSearch).catch(() => setPaidTicketsForRefund([]));
+    }, 250);
+    return () => window.clearTimeout(handle);
+  }, [refundPickerOpen, refundSelected, deferredRefundSearch]);
+
+  async function submitRefundFromPicker(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!refundSelected) return;
+    const fd = new FormData(e.currentTarget);
+    const reason = String(fd.get("reason") ?? "").trim();
+    if (!reason) return;
+    const amountCentavos = Math.round(Number(fd.get("pesos") ?? "0") * 100);
+    if (amountCentavos <= 0) {
+      setError("Enter a valid refund amount.");
+      return;
+    }
+    setRefundBusy(true);
+    const seq = ++lastRequestSeq.current;
+    try {
+      await api(`/tickets/${refundSelected.id}/refunds`, {
+        method: "POST",
+        json: {
+          amountCentavos,
+          reason,
+          note: String(fd.get("note") ?? "") || undefined,
+        },
+      });
+      if (seq === lastRequestSeq.current) {
+        closeRefundPicker();
+        publishAnalyticsUpdate();
+        setNotice("Refund recorded");
+      }
+    } catch {
+      if (seq === lastRequestSeq.current) {
+        setError("Failed to record refund.");
+      }
+    } finally {
+      if (seq === lastRequestSeq.current) setRefundBusy(false);
+    }
+  }
+
   async function voidWholeTicket() {
     const reason = window.prompt("Void entire ticket? Type reason:");
     if (!reason || !ticketId) return;
@@ -839,33 +1107,6 @@ export function PosPage() {
     newTicket();
     publishKdsUpdate("ticket_voided");
     setNotice("Ticket voided");
-  }
-
-  async function submitRefund(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (!ticketId) return;
-    const fd = new FormData(e.currentTarget);
-    const seq = ++lastRequestSeq.current;
-    try {
-      const res = await api<any>(`/tickets/${ticketId}/refunds`, {
-        method: "POST",
-        json: {
-          amountCentavos: Math.round(Number(fd.get("pesos") ?? "0") * 100),
-          reason: String(fd.get("reason") ?? ""),
-          note: String(fd.get("note") ?? "") || undefined,
-        },
-      });
-      if (seq === lastRequestSeq.current) {
-        setRefundOpen(false);
-        updateTicketState(res);
-        setNotice("Refund recorded");
-      }
-    } catch (err) {
-      if (seq === lastRequestSeq.current) {
-        refreshTicket(ticketId);
-        setError("Failed to record refund.");
-      }
-    }
   }
 
   const pending = payments.filter((p) => p.status === "pending_ewallet");
@@ -883,7 +1124,7 @@ export function PosPage() {
         updateTicketState(res);
         setNotice("Ticket metadata updated");
       }
-    } catch (err) {
+    } catch {
       if (seq === lastRequestSeq.current) {
         refreshTicket(ticketId);
         setError("Failed to update ticket metadata.");
@@ -892,58 +1133,88 @@ export function PosPage() {
   }
 
   const canVoid = me && isManager(me.role);
+  const canRefund = Boolean(canVoid);
+
+  const filteredPaidTickets = useMemo(() => {
+    const q = refundSearch.trim().toLowerCase().replace(/^#/, "");
+    if (!q) return paidTicketsForRefund;
+    return paidTicketsForRefund.filter((t) => {
+      const no = String(t.ticket_no).padStart(4, "0");
+      return no.includes(q.replace(/\D/g, "")) || `#${no}`.includes(q);
+    });
+  }, [paidTicketsForRefund, refundSearch]);
 
   return (
     <div className="pos-page stack" style={{ gap: 16 }}>
       {bootLoading ? <div className="card muted">Loading POS data…</div> : null}
       {error ? <div className="error">{error}</div> : null}
-      <div className="pos-topbar">
-        <div className="filter-icon-wrap pos-search">
-          <span className="filter-icon">⌕</span>
-          <input className="field" placeholder="Search for coffee, food etc" value={search} onChange={(e) => setSearch(e.target.value)} />
-        </div>
-        <div>
-          <div className="label">Register</div>
-          <select className="field" style={{ maxWidth: 360 }} value={registerId} onChange={(e) => setRegisterId(e.target.value)}>
-            <option value="">Select…</option>
-            {registers.map((r) => (
-              <option key={r.id} value={r.id}>
-                {r.name} — {r.id.slice(0, 8)}…
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="row pos-action-bar">
-          <button type="button" className="ghost-btn pos-icon-btn" onClick={() => newTicket()} disabled={!ticketId} title="New ticket" aria-label="New ticket">
-            <span aria-hidden="true">＋</span>
-          </button>
-          <button type="button" className="ghost-btn pos-icon-btn" onClick={() => void parkTicket()} disabled={!ticketId} title="Park / hold" aria-label="Park / hold">
-            <span aria-hidden="true">⏸</span>
-          </button>
-          {ticketId && canVoid ? (
-            <button type="button" className="ghost-btn pos-icon-btn" onClick={() => setRefundOpen(true)} disabled={!ticketId} title="Refund" aria-label="Refund">
-              <span aria-hidden="true">↩</span>
-            </button>
-          ) : null}
-        </div>
-      </div>
-      <div className="row pos-categories" style={{ flexWrap: "wrap", gap: 8 }}>
-        {categoryFilters.map((category) => (
-          <button
-            key={category.id}
-            type="button"
-            className={activeCategoryId === category.id ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
-            onClick={() => setActiveCategoryId(category.id)}
-          >
-            {category.label}
-          </button>
-        ))}
-      </div>
 
-      <div className="panel-split">
-        <div className="stack pos-products-pane" style={{ gap: 12 }}>
-          <div className="pos-products-scroll">
-            <div className="grid-products">
+      <div className="panel-split pos-layout">
+        <div className="pos-main-column stack">
+          <div className="pos-topbar">
+            <div className="filter-icon-wrap pos-search">
+              <span className="filter-icon">⌕</span>
+              <input className="field" placeholder="Search for coffee, food etc" value={search} onChange={(e) => setSearch(e.target.value)} />
+            </div>
+            <div className="pos-register-wrap">
+              <div className="label">Register</div>
+              <select className="field" value={registerId} onChange={(e) => setRegisterId(e.target.value)}>
+                <option value="">Select…</option>
+                {registers.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name} — {r.id.slice(0, 8)}…
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="row pos-action-bar">
+              <button type="button" className="ghost-btn pos-icon-btn" onClick={() => newTicket()} disabled={!ticketId} title="New ticket" aria-label="New ticket">
+                <span aria-hidden="true">＋</span>
+              </button>
+              <button type="button" className="ghost-btn pos-icon-btn" onClick={() => void parkTicket()} disabled={!ticketId || lines.length === 0} title="Park / hold" aria-label="Park / hold">
+                <span aria-hidden="true">⏸</span>
+              </button>
+              {parkedTickets.length > 0 ? (
+                <button
+                  type="button"
+                  className="ghost-btn pos-parked-badge"
+                  onClick={() => setParkModalOpen(true)}
+                  title="View parked orders"
+                >
+                  <span aria-hidden="true">📋</span>
+                  <span>{parkedTickets.length}</span>
+                </button>
+              ) : null}
+              {canRefund ? (
+                <button
+                  type="button"
+                  className="ghost-btn pos-icon-btn"
+                  onClick={() => openRefundPicker()}
+                  title="Refund ticket"
+                  aria-label="Refund ticket"
+                >
+                  <span aria-hidden="true">↩</span>
+                </button>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="row pos-categories" style={{ flexWrap: "wrap", gap: 8 }}>
+            {categoryFilters.map((category) => (
+              <button
+                key={category.id}
+                type="button"
+                className={activeCategoryId === category.id ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
+                onClick={() => setActiveCategoryId(category.id)}
+              >
+                {category.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="pos-products-pane">
+            <div className="pos-products-scroll">
+              <div className="grid-products">
               {filtered.map((p) => {
                 const categoryName = categories.find(c => c.id === p.category_id)?.name || "Uncategorized";
                 const imageKey = p.image_r2_key ? String(p.image_r2_key) : "";
@@ -988,8 +1259,47 @@ export function PosPage() {
             </div>
           </div>
         </div>
+        </div>
 
-        <aside className="cart stack">
+        <aside className="cart stack pos-cart-panel">
+          {parkedTickets.length > 0 ? (
+            <div className="parked-queue">
+              <div className="parked-queue-header">
+                <span className="parked-queue-title">Parked orders</span>
+                <span className="parked-queue-count">{parkedTickets.length}</span>
+              </div>
+              <div className="parked-queue-list">
+                {parkedTickets.map((row) => {
+                  const label = String(row.parked_label ?? "").trim() || formatTicketLabel(row.id, Number(row.ticket_no ?? 0) || null);
+                  const qty = Number(row.item_qty ?? 0);
+                  const due = Number(row.due_centavos ?? 0);
+                  const isActive = ticketId === row.id;
+                  return (
+                    <button
+                      key={row.id}
+                      type="button"
+                      className={`parked-queue-item${isActive ? " is-active" : ""}`}
+                      disabled={busy}
+                      onClick={() => void resumeParkedTicket(row)}
+                    >
+                      <div className="parked-queue-item-main">
+                        <span className="parked-queue-name">{label}</span>
+                        <span className="parked-queue-meta">
+                          {formatTicketLabel(row.id, Number(row.ticket_no ?? 0) || null)}
+                          {qty > 0 ? ` · ${qty} item${qty === 1 ? "" : "s"}` : ""}
+                        </span>
+                      </div>
+                      <div className="parked-queue-item-side">
+                        {due > 0 ? <span className="parked-queue-due">{formatPhp(due)}</span> : null}
+                        <span className="parked-queue-time">{formatParkedWhen(row.updated_at)}</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
           <div className="row" style={{ justifyContent: "space-between" }}>
             <strong>Ticket</strong>
             <span className="muted">{formatTicketLabel(ticketId, ticketNumber)}</span>
@@ -1359,25 +1669,93 @@ export function PosPage() {
         </div>
       ) : null}
 
-      {refundOpen && ticketId ? (
+      {refundPickerOpen ? (
         <div className="sheet" role="dialog">
-          <div className="sheet-inner stack">
-            <h2 style={{ margin: 0 }}>Refund</h2>
-            <form className="stack" onSubmit={submitRefund}>
-              <input className="field" name="pesos" type="number" step="0.01" required placeholder="Amount PHP" />
-              <input className="field" name="reason" required placeholder="Reason" />
-              <input className="field" name="note" placeholder="Manual GCash note (optional)" />
-              <div className="row">
-                <button className="primary-btn" type="submit">
-                  <span className="btn-icon">↩</span>
-                  <span>Record refund</span>
-                </button>
-                <button type="button" className="ghost-btn" onClick={() => setRefundOpen(false)}>
-                  <span className="btn-icon">✕</span>
-                  <span>Cancel</span>
-                </button>
-              </div>
-            </form>
+          <div className="sheet-inner stack refund-picker-sheet">
+            {!refundSelected ? (
+              <>
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                  <h2 style={{ margin: 0 }}>Refund ticket</h2>
+                  <button type="button" className="ghost-btn tiny-btn" onClick={closeRefundPicker} aria-label="Close">
+                    ✕
+                  </button>
+                </div>
+                <p className="muted" style={{ margin: 0 }}>Select a paid ticket to refund. Search by ticket number.</p>
+                <div className="filter-icon-wrap">
+                  <span className="filter-icon">⌕</span>
+                  <input
+                    className="field"
+                    placeholder="Search ticket # e.g. 0222"
+                    value={refundSearch}
+                    onChange={(e) => setRefundSearch(e.target.value)}
+                    autoFocus
+                  />
+                </div>
+                <div className="refund-ticket-list">
+                  {filteredPaidTickets.length === 0 ? (
+                    <p className="muted" style={{ margin: 0, padding: "12px 4px" }}>No refundable paid tickets found.</p>
+                  ) : (
+                    filteredPaidTickets.map((row) => {
+                      const label = `#${String(row.ticket_no).padStart(4, "0")}`;
+                      return (
+                        <button
+                          key={row.id}
+                          type="button"
+                          className="refund-ticket-item"
+                          onClick={() => setRefundSelected(row)}
+                        >
+                          <div>
+                            <strong>{label}</strong>
+                            <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>
+                              {row.ticket_type.replace("_", " ")} · {new Date(row.updated_at).toLocaleString()}
+                            </span>
+                          </div>
+                          <div style={{ textAlign: "right" }}>
+                            <div style={{ fontWeight: 700 }}>{formatPhp(row.refundable_centavos)}</div>
+                            <span className="muted" style={{ fontSize: 11 }}>refundable</span>
+                          </div>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                  <h2 style={{ margin: 0 }}>Refund #{String(refundSelected.ticket_no).padStart(4, "0")}</h2>
+                  <button type="button" className="ghost-btn tiny-btn" onClick={() => setRefundSelected(null)} aria-label="Back">
+                    ← Back
+                  </button>
+                </div>
+                <p className="muted" style={{ margin: 0 }}>
+                  Paid {formatPhp(refundSelected.paid_centavos)}
+                  {refundSelected.refunded_centavos > 0 ? ` · Already refunded ${formatPhp(refundSelected.refunded_centavos)}` : ""}
+                </p>
+                <form className="stack" onSubmit={submitRefundFromPicker}>
+                  <input
+                    className="field"
+                    name="pesos"
+                    type="number"
+                    step="0.01"
+                    required
+                    defaultValue={(refundSelected.refundable_centavos / 100).toFixed(2)}
+                    placeholder="Amount PHP"
+                  />
+                  <input className="field" name="reason" required placeholder="Refund reason" autoFocus />
+                  <input className="field" name="note" placeholder="Note (optional)" />
+                  <div className="row">
+                    <button className="primary-btn" type="submit" disabled={refundBusy}>
+                      <span className="btn-icon">↩</span>
+                      <span>{refundBusy ? "Processing…" : "Process refund"}</span>
+                    </button>
+                    <button type="button" className="ghost-btn" onClick={closeRefundPicker} disabled={refundBusy}>
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              </>
+            )}
           </div>
         </div>
       ) : null}
@@ -1438,6 +1816,75 @@ export function PosPage() {
                 <span>Cancel</span>
               </button>
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {parkModalOpen ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack" style={{ maxWidth: 480 }}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+              <h2 style={{ margin: 0 }}>{ticketId && lines.length > 0 ? "Park this order" : "Parked orders"}</h2>
+              <button type="button" className="ghost-btn tiny-btn" onClick={() => { setParkModalOpen(false); setParkLabel(""); }}>
+                ✕ Close
+              </button>
+            </div>
+            {ticketId && lines.length > 0 ? (
+              <form className="stack parked-park-form" onSubmit={confirmParkTicket}>
+                <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+                  Hold {formatTicketLabel(ticketId, ticketNumber)} ({lines.length} item{lines.length === 1 ? "" : "s"}
+                  {totals ? ` · ${formatPhp(totals.dueCentavos)}` : ""}) for a customer who will order later.
+                </p>
+                <div className="label">Customer name or identifier</div>
+                <input
+                  className="field"
+                  value={parkLabel}
+                  onChange={(e) => setParkLabel(e.target.value)}
+                  placeholder="e.g. Maria, Table 3, Blue jacket"
+                  autoFocus
+                  required
+                  maxLength={100}
+                />
+                <button className="primary-btn" type="submit" disabled={parkBusy}>
+                  {parkBusy ? "Parking…" : "Park & start new order"}
+                </button>
+              </form>
+            ) : null}
+            {parkedTickets.length > 0 ? (
+              <div className="stack" style={{ gap: 8 }}>
+                <div className="label" style={{ marginBottom: 0 }}>Queue — tap to resume</div>
+                <div className="parked-queue-list parked-queue-list-modal">
+                  {parkedTickets.map((row) => {
+                    const label = String(row.parked_label ?? "").trim() || formatTicketLabel(row.id, Number(row.ticket_no ?? 0) || null);
+                    const qty = Number(row.item_qty ?? 0);
+                    const due = Number(row.due_centavos ?? 0);
+                    return (
+                      <button
+                        key={row.id}
+                        type="button"
+                        className="parked-queue-item"
+                        disabled={busy}
+                        onClick={() => void resumeParkedTicket(row)}
+                      >
+                        <div className="parked-queue-item-main">
+                          <span className="parked-queue-name">{label}</span>
+                          <span className="parked-queue-meta">
+                            {formatTicketLabel(row.id, Number(row.ticket_no ?? 0) || null)}
+                            {qty > 0 ? ` · ${qty} item${qty === 1 ? "" : "s"}` : ""}
+                          </span>
+                        </div>
+                        <div className="parked-queue-item-side">
+                          {due > 0 ? <span className="parked-queue-due">{formatPhp(due)}</span> : null}
+                          <span className="parked-queue-time">{formatParkedWhen(row.updated_at)}</span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : ticketId && lines.length > 0 ? null : (
+              <p className="muted" style={{ margin: 0 }}>No parked orders on this register.</p>
+            )}
           </div>
         </div>
       ) : null}

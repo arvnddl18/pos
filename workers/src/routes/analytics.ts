@@ -51,12 +51,12 @@ analyticsRoutes.get("/kpi", requireAuth(), requireManager(), async (c) => {
   ).bind(auth.orgId).first<Record<string, number | null>>();
 
   const topProduct = await c.env.DB.prepare(
-    `SELECT pr.name, COUNT(li.id) as sold
+    `SELECT pr.name, COALESCE(SUM(li.qty), 0) as sold
      FROM line_items li
      JOIN tickets t ON t.id = li.ticket_id
      JOIN products pr ON pr.id = li.product_id
      WHERE t.org_id = ? AND t.status = 'paid' AND li.voided = 0 ${demoClause} ${dc}
-     GROUP BY pr.name ORDER BY sold DESC LIMIT 1`
+     GROUP BY pr.id, pr.name ORDER BY sold DESC LIMIT 1`
   ).bind(auth.orgId).first<{ name: string; sold: number }>();
 
   const cupsSold = await c.env.DB.prepare(
@@ -140,27 +140,33 @@ analyticsRoutes.get("/trends/daily", requireAuth(), requireManager(), async (c) 
   return c.json({ daily: results.results ?? [] });
 });
 
-// Product trends
+// Product trends (cup drinks vs food/item by category product_kind)
 analyticsRoutes.get("/trends/products", requireAuth(), requireManager(), async (c) => {
   const auth = c.get("auth")!;
   const demo = c.req.query("demographic") ?? null;
   const dateFrom = c.req.query("dateFrom");
   const dateTo = c.req.query("dateTo");
   const dateMonth = c.req.query("dateMonth");
+  const kindRaw = c.req.query("kind") ?? "cup";
+  const kind = kindRaw === "item" ? "item" : "cup";
   const demoClause = demo ? `AND t.demographic_color = '${demo}'` : "";
   const dc = dateClause(dateFrom, dateTo, dateMonth, "t");
 
   const results = await c.env.DB.prepare(
-    `SELECT pr.name, COUNT(li.id) as sold_count,
+    `SELECT pr.name, COALESCE(SUM(li.qty), 0) as sold_count,
        COALESCE(SUM(li.unit_price_centavos * li.qty - li.discount_centavos), 0) as revenue
      FROM line_items li
      JOIN tickets t ON t.id = li.ticket_id
      JOIN products pr ON pr.id = li.product_id
-     WHERE t.org_id = ? AND t.status = 'paid' AND li.voided = 0 ${demoClause} ${dc}
-     GROUP BY pr.name ORDER BY sold_count DESC LIMIT 10`
-  ).bind(auth.orgId).all();
+     LEFT JOIN categories cat ON cat.id = pr.category_id
+     WHERE t.org_id = ? AND t.status = 'paid' AND li.voided = 0
+       AND COALESCE(cat.product_kind, 'cup') = ? ${demoClause} ${dc}
+     GROUP BY pr.id, pr.name ORDER BY sold_count DESC LIMIT 10`,
+  )
+    .bind(auth.orgId, kind)
+    .all();
 
-  return c.json({ products: results.results ?? [] });
+  return c.json({ products: results.results ?? [], kind });
 });
 
 // Order types

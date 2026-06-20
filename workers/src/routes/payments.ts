@@ -274,7 +274,9 @@ paymentRoutes.post("/tickets/:ticketId/refunds", requireAuth(), requireManager()
   const ticketId = c.req.param("ticketId");
   const body = RefundIn.parse(await c.req.json());
 
-  const ticket = await c.env.DB.prepare(`SELECT id FROM tickets WHERE id = ? AND org_id = ?`).bind(ticketId, auth.orgId).first();
+  const ticket = await c.env.DB.prepare(`SELECT id, ticket_no FROM tickets WHERE id = ? AND org_id = ?`)
+    .bind(ticketId, auth.orgId)
+    .first<{ id: string; ticket_no: number | null }>();
   if (!ticket) return c.json({ error: "not_found" }, 404);
 
   const paidRow = await c.env.DB.prepare(
@@ -304,9 +306,10 @@ paymentRoutes.post("/tickets/:ticketId/refunds", requireAuth(), requireManager()
     db: c.env.DB,
     orgId: auth.orgId,
     userId: auth.id,
-    action: "refund.create",
-    entityId: id,
-    payload: body,
+    action: "ticket.refund",
+    entityType: "ticket",
+    entityId: ticketId,
+    payload: { ...body, refundId: id, ticketNo: ticket.ticket_no },
   });
 
   const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);

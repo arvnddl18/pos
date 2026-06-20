@@ -42,6 +42,97 @@ function KpiCard({ label, value, sub }: { label: string; value: string; sub?: st
   );
 }
 
+type TopProductRow = { name: string; sold_count: number; revenue: number };
+
+function TopProductsPanel({
+  title,
+  products,
+  demo,
+  unitLabel,
+  emptyLabel,
+  ct,
+}: {
+  title: string;
+  products: TopProductRow[];
+  demo: string;
+  unitLabel: string;
+  emptyLabel: string;
+  ct: { grid: string; axis: string; bg: string };
+}) {
+  return (
+    <div className="card stack" style={{ flex: "1 1 320px", gap: 10 }}>
+      <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>{title}</h3>
+      {products.length === 0 ? (
+        <div className="muted" style={{ fontSize: 13 }}>{emptyLabel}</div>
+      ) : (
+        <>
+          <div className="stack" style={{ gap: 6 }}>
+            {products.slice(0, 5).map((p, i) => (
+              <div
+                key={`${p.name}-${i}`}
+                className="row"
+                style={{
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  padding: "8px 12px",
+                  background: "var(--bg)",
+                  borderRadius: 8,
+                  border: "1px solid var(--border)",
+                }}
+              >
+                <div className="row" style={{ gap: 8, alignItems: "center", flex: 1, minWidth: 0 }}>
+                  <span style={{ fontWeight: 700, fontSize: 11, color: "var(--muted)", minWidth: 18 }}>#{i + 1}</span>
+                  <span
+                    style={{
+                      fontWeight: 600,
+                      color: "var(--text)",
+                      fontSize: 13,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {p.name}
+                  </span>
+                </div>
+                <div className="row" style={{ gap: 10, flexShrink: 0 }}>
+                  <span style={{ fontWeight: 700, color: "var(--accent-strong)", fontSize: 13 }}>
+                    {Number(p.sold_count).toLocaleString()} {unitLabel}
+                  </span>
+                  <span className="muted" style={{ fontSize: 11 }}>{formatPhp(Number(p.revenue))}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <ResponsiveContainer width="100%" height={150}>
+            <BarChart data={products.slice(0, 6)} layout="vertical" margin={{ left: 0, right: 8, top: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} />
+              <XAxis type="number" stroke={ct.axis} tick={{ fontSize: 10 }} allowDecimals={false} />
+              <YAxis type="category" dataKey="name" stroke={ct.axis} tick={{ fontSize: 10 }} width={100} />
+              <Tooltip
+                contentStyle={{
+                  backgroundColor: ct.bg,
+                  border: `1px solid ${ct.grid}`,
+                  borderRadius: 10,
+                  color: "var(--text)",
+                  fontSize: 12,
+                }}
+                formatter={(v) => [Number(v ?? 0).toLocaleString(), unitLabel]}
+              />
+              <Bar
+                dataKey="sold_count"
+                name={unitLabel}
+                fill={demo ? DEMO_COLORS[demo] ?? "var(--accent)" : "var(--accent)"}
+                radius={[0, 4, 4, 0]}
+              />
+            </BarChart>
+          </ResponsiveContainer>
+        </>
+      )}
+    </div>
+  );
+}
+
 export function ReportsPage() {
   const [tab, setTab] = useState<"eod" | "analytics" | "forecast" | "feedback" | "audit">("eod");
   const [demo, setDemo] = useState("");
@@ -84,7 +175,8 @@ export function ReportsPage() {
   const [demographics, setDemographics] = useState<any[]>([]);
   const [orderTypes, setOrderTypes] = useState<any[]>([]);
   const [daily, setDaily] = useState<any[]>([]);
-  const [products, setProducts] = useState<any[]>([]);
+  const [cupProducts, setCupProducts] = useState<TopProductRow[]>([]);
+  const [itemProducts, setItemProducts] = useState<TopProductRow[]>([]);
   const [feedbacks, setFeedbacks] = useState<any[]>([]);
   const [feedbackModalTicketId, setFeedbackModalTicketId] = useState<string | null>(null);
   const [forecast, setForecast] = useState<any>(null);
@@ -139,7 +231,12 @@ export function ReportsPage() {
     api<{ demographics: any[] }>(`/analytics/demographics?x=1${dq}`).then(r => setDemographics(r.demographics ?? [])).catch(() => setDemographics([]));
     api<{ orderTypes: any[] }>(`/analytics/order-types?x=1${demoQ}${dq}`).then(r => setOrderTypes(r.orderTypes ?? [])).catch(() => setOrderTypes([]));
     api<{ daily: any[] }>(`/analytics/trends/daily?x=1${demoQ}${dq}`).then(r => setDaily(r.daily ?? [])).catch(() => setDaily([]));
-    api<{ products: any[] }>(`/analytics/trends/products?x=1${demoQ}${dq}`).then(r => setProducts(r.products ?? [])).catch(() => setProducts([]));
+    api<{ products: TopProductRow[] }>(`/analytics/trends/products?x=1&kind=cup${demoQ}${dq}`)
+      .then(r => setCupProducts(r.products ?? []))
+      .catch(() => setCupProducts([]));
+    api<{ products: TopProductRow[] }>(`/analytics/trends/products?x=1&kind=item${demoQ}${dq}`)
+      .then(r => setItemProducts(r.products ?? []))
+      .catch(() => setItemProducts([]));
   }
   function refreshFeedback() {
     const dq = buildDateQ();
@@ -163,6 +260,45 @@ export function ReportsPage() {
     else if (tab === "analytics") refreshAnalytics();
     else if (tab === "feedback") refreshFeedback();
     else if (tab === "forecast") refreshForecast();
+  }, [tab, demo, dateType, dateDay, dateFrom, dateTo, dateMonth]);
+
+  useEffect(() => {
+    if (tab !== "eod" && tab !== "audit") return;
+    const onDataChanged = () => {
+      if (tab === "eod") refreshEod();
+      else if (tab === "audit") refreshAudit();
+    };
+    window.addEventListener("pos:data-changed", onDataChanged);
+    window.addEventListener("pos:analytics-changed", onDataChanged);
+    const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("pos-live") : null;
+    channel?.addEventListener("message", (ev: MessageEvent) => {
+      if (ev.data?.type === "analytics:refresh") onDataChanged();
+    });
+    return () => {
+      window.removeEventListener("pos:data-changed", onDataChanged);
+      window.removeEventListener("pos:analytics-changed", onDataChanged);
+      channel?.close();
+    };
+  }, [tab, demo, dateType, dateDay, dateFrom, dateTo, dateMonth]);
+
+  useEffect(() => {
+    if (tab !== "analytics") return;
+    const onAnalyticsChanged = () => {
+      refreshAnalytics();
+    };
+    window.addEventListener("pos:analytics-changed", onAnalyticsChanged);
+    window.addEventListener("pos:data-changed", onAnalyticsChanged);
+    const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("pos-live") : null;
+    channel?.addEventListener("message", (ev: MessageEvent) => {
+      if (ev.data?.type === "analytics:refresh") onAnalyticsChanged();
+    });
+    const intervalId = window.setInterval(onAnalyticsChanged, 30_000);
+    return () => {
+      window.removeEventListener("pos:analytics-changed", onAnalyticsChanged);
+      window.removeEventListener("pos:data-changed", onAnalyticsChanged);
+      channel?.close();
+      window.clearInterval(intervalId);
+    };
   }, [tab, demo, dateType, dateDay, dateFrom, dateTo, dateMonth]);
 
   async function submitRetroactiveFeedback(e: FormEvent<HTMLFormElement>) {
@@ -202,6 +338,8 @@ export function ReportsPage() {
         json: { amountCentavos: Math.round(pesos * 100), reason, note: "Refunded from Audit log" }
       });
       refreshAudit();
+      refreshEod();
+      window.dispatchEvent(new CustomEvent("pos:data-changed"));
       alert("Refund recorded successfully.");
     } catch (e: any) {
       alert("Failed to refund: " + e.message);
@@ -522,6 +660,8 @@ export function ReportsPage() {
                       ["Marketing Expense", formatPhp(Number(s.marketingExpenseCentavos ?? 0))],
                       ["Total Discounts", formatPhp(Number(s.totalDiscountsCentavos ?? s.discountsCentavos ?? 0))],
                       ["Net Sales", formatPhp(Number(s.netSalesCentavos))],
+                      ["Less: Refunds / Returns", formatPhp(-Number(s.refundsCentavos ?? 0))],
+                      ["Adjusted Net Sales", formatPhp(Number(s.adjustedNetSalesCentavos ?? s.netSalesCentavos))],
                       ["VATable Sales", formatPhp(Number(s.vatableSalesCentavos))],
                       ["Output VAT 12%", formatPhp(Number(s.vatCollectedCentavos))],
                       ["VAT-Exempt", "₱0.00"],
@@ -705,47 +845,28 @@ export function ReportsPage() {
               </div>
             </div>
 
-            {/* Row 3: Top Products + Order Type Split side by side */}
+            {/* Row 3: Top Cup Products + Top Item Product */}
             <div className="row" style={{ gap: 18, flexWrap: "wrap", alignItems: "stretch" }}>
+              <TopProductsPanel
+                title={`Top Cup Products${demo ? ` · ${DEMOGRAPHICS.find(d => d.value === demo)?.label}` : ""}`}
+                products={cupProducts}
+                demo={demo}
+                unitLabel="cups"
+                emptyLabel="No cup product sales for this filter."
+                ct={ct}
+              />
+              <TopProductsPanel
+                title={`Top Item Product${demo ? ` · ${DEMOGRAPHICS.find(d => d.value === demo)?.label}` : ""}`}
+                products={itemProducts}
+                demo={demo}
+                unitLabel="items"
+                emptyLabel="No food/item sales for this filter. Mark categories as Item (e.g. Scrolls) in Catalog admin."
+                ct={ct}
+              />
+            </div>
 
-              {/* Top Products */}
-              <div className="card stack" style={{ flex: "1 1 320px", gap: 10 }}>
-                <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>
-                  Top Products {demo ? `· ${DEMOGRAPHICS.find(d=>d.value===demo)?.label}` : ""}
-                </h3>
-                {products.length === 0
-                  ? <div className="muted" style={{ fontSize: 13 }}>No product data.</div>
-                  : (
-                    <>
-                      <div className="stack" style={{ gap: 6 }}>
-                        {products.slice(0, 5).map((p, i) => (
-                          <div key={i} className="row" style={{ justifyContent: "space-between", alignItems: "center", padding: "8px 12px", background: "var(--bg)", borderRadius: 8, border: "1px solid var(--border)" }}>
-                            <div className="row" style={{ gap: 8, alignItems: "center", flex: 1, minWidth: 0 }}>
-                              <span style={{ fontWeight: 700, fontSize: 11, color: "var(--muted)", minWidth: 18 }}>#{i+1}</span>
-                              <span style={{ fontWeight: 600, color: "var(--text)", fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
-                            </div>
-                            <div className="row" style={{ gap: 10, flexShrink: 0 }}>
-                              <span style={{ fontWeight: 700, color: "var(--accent-strong)", fontSize: 13 }}>{p.sold_count} cups</span>
-                              <span className="muted" style={{ fontSize: 11 }}>{formatPhp(Number(p.revenue))}</span>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                      <ResponsiveContainer width="100%" height={150}>
-                        <BarChart data={products.slice(0, 6)} layout="vertical" margin={{ left: 0, right: 8, top: 0, bottom: 0 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} />
-                          <XAxis type="number" stroke={ct.axis} tick={{ fontSize: 10 }} />
-                          <YAxis type="category" dataKey="name" stroke={ct.axis} tick={{ fontSize: 10 }} width={100} />
-                          <Tooltip contentStyle={{ backgroundColor: ct.bg, border: `1px solid ${ct.grid}`, borderRadius: 10, color: "var(--text)", fontSize: 12 }} />
-                          <Bar dataKey="sold_count" name="Units Sold" fill={demo ? DEMO_COLORS[demo] ?? "var(--accent)" : "var(--accent)"} radius={[0, 4, 4, 0]} />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </>
-                  )
-                }
-              </div>
-
-              {/* Order Types */}
+            {/* Row 4: Order Type Split */}
+            <div className="row" style={{ gap: 18, flexWrap: "wrap", alignItems: "stretch" }}>
               <div className="card stack" style={{ flex: "1 1 240px", gap: 10 }}>
                 <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>Order Type Split</h3>
                 {orderTypes.length === 0
@@ -1060,19 +1181,27 @@ export function ReportsPage() {
           )}
           {filteredAudit.map(ev => {
             const isPurchase = ev.action === "ticket.create" || ev.action === "ticket.close_freebie";
+            const isTicketLifecycle = [
+              "ticket.opened",
+              "ticket.parked",
+              "ticket.resumed",
+              "ticket.void",
+              "ticket.refund",
+              "refund.create",
+            ].includes(String(ev.action));
             const formattedTicketNo = ev.ticket_no ? `#${String(ev.ticket_no).padStart(4, "0")}` : null;
             return (
               <div key={String(ev.id)} className="row" style={{ fontSize: 13, borderBottom: "1px solid var(--border)", padding: "14px 12px", gap: 16, alignItems: "center", background: isPurchase ? "color-mix(in srgb, var(--ok) 5%, transparent)" : "transparent", borderRadius: isPurchase ? 8 : 0, margin: isPurchase ? "3px 0" : 0 }}>
                 <div className="muted" style={{ minWidth: 140 }}>{new Date(String(ev.created_at)).toLocaleString()}</div>
                 <div style={{ flex: 1, color: "var(--text)" }}>
                   <strong style={{ color: "var(--ok)", fontSize: 14 }}>{String(ev.action)}</strong>
-                  {ev.entity_type ? <span className="muted" style={{ marginLeft: 6 }}>· {String(ev.entity_type)}</span> : ""}
                   {isPurchase ? <span style={{ marginLeft: 8, padding: "2px 6px", background: "var(--ok)", color: "#fff", borderRadius: 4, fontSize: 10, fontWeight: 700 }}>ORDER PROCESSED</span> : null}
-                  {isPurchase && formattedTicketNo ? (
+                  {formattedTicketNo && (isPurchase || isTicketLifecycle) ? (
                     <span style={{ marginLeft: 8, padding: "2px 7px", background: "var(--accent-muted)", color: "var(--accent-strong)", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid var(--accent)" }}>
                       Ticket {formattedTicketNo}
                     </span>
                   ) : null}
+                  {ev.entity_type && !isTicketLifecycle && !isPurchase ? <span className="muted" style={{ marginLeft: 6 }}>· {String(ev.entity_type)}</span> : ""}
                 </div>
                 <div className="row" style={{ gap: 8 }}>
                   {isPurchase && ev.entity_id && (

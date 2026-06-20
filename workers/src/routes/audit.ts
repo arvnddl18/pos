@@ -26,10 +26,11 @@ auditRoutes.get("/", requireAuth(), requireManager(), async (c) => {
   
   const rows = await c.env.DB.prepare(
     `SELECT a.id, a.user_id, u.display_name as user_name, a.register_id, a.action, a.entity_type, a.entity_id, a.payload_json, a.created_at,
-            t.ticket_no
+            COALESCE(t.ticket_no, CAST(json_extract(a.payload_json, '$.ticketNo') AS INTEGER)) as ticket_no
      FROM audit_events a
      LEFT JOIN users u ON a.user_id = u.id
-     LEFT JOIN tickets t ON a.entity_type = 'ticket' AND a.entity_id = t.id AND t.org_id = a.org_id
+     LEFT JOIN refunds rf ON a.action = 'refund.create' AND a.entity_id = rf.id
+     LEFT JOIN tickets t ON t.org_id = a.org_id AND (t.id = a.entity_id OR t.id = rf.ticket_id)
      WHERE a.org_id = ? ${dc}
      ORDER BY a.created_at DESC 
      LIMIT ?`

@@ -170,8 +170,21 @@ reportRoutes.get("/bir", requireAuth(), requireManager(), async (c) => {
   }
 
   // Use subqueries for aggregation to avoid Cartesian product duplication from multiple line items
+  let dcRefund: string;
+  if (c.req.query("date")) {
+    dcRefund = `AND date(r.created_at) = '${day}'`;
+  } else {
+    dcRefund = dateClause(dateFrom, dateTo, dateMonth, "r.created_at").clause;
+  }
+
+  const refundsRow = await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(r.amount_centavos), 0) as total FROM refunds r
+     JOIN tickets t ON t.id = r.ticket_id
+     WHERE t.org_id = ? ${dcRefund}`,
+  ).bind(auth.orgId).first<{ total: number }>();
+
   const tickets = await c.env.DB.prepare(
-    `SELECT t.id, t.ticket_type, t.created_at, t.tax_centavos_snapshot, t.notes,
+    `SELECT t.id, t.ticket_no, t.ticket_type, t.created_at, t.tax_centavos_snapshot, t.notes,
        (SELECT COALESCE(SUM(li.unit_price_centavos * li.qty), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as gross_amount,
        (SELECT COALESCE(SUM(li.discount_centavos), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as discount_amount
      FROM tickets t
@@ -204,7 +217,8 @@ reportRoutes.get("/bir", requireAuth(), requireManager(), async (c) => {
     
     return {
       no: idx + 1,
-      ticketId: String(r.id).slice(0, 8).toUpperCase(),
+      ticketId: r.ticket_no ? `#${String(r.ticket_no).padStart(4, "0")}` : String(r.id).slice(0, 8).toUpperCase(),
+      ticketNo: Number(r.ticket_no ?? 0) || null,
       time: new Date(String(r.created_at)).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit" }),
       date: new Date(String(r.created_at)).toLocaleDateString("en-PH"),
       type: String(r.ticket_type).replace("_", "-"),
@@ -217,6 +231,9 @@ reportRoutes.get("/bir", requireAuth(), requireManager(), async (c) => {
     };
   });
 
+  const refundAmt = Number(refundsRow?.total ?? 0);
+  const adjustedNet = totalNet - refundAmt;
+
   return c.json({
     date: day,
     transactions: items,
@@ -228,7 +245,9 @@ reportRoutes.get("/bir", requireAuth(), requireManager(), async (c) => {
       marketingExpenseCentavos: totalMarketingExpense,
       totalDiscountsCentavos: totalDiscountOnly + totalMarketingExpense,
       netSalesCentavos: totalNet,
-      vatableSalesCentavos: totalTax > 0 ? Math.round(totalNet / 1.12) : totalNet,
+      refundsCentavos: refundAmt,
+      adjustedNetSalesCentavos: adjustedNet,
+      vatableSalesCentavos: totalTax > 0 ? Math.round(adjustedNet / 1.12) : adjustedNet,
       vatCollectedCentavos: totalTax,
       vatExemptCentavos: 0,
       zeroRatedCentavos: 0,

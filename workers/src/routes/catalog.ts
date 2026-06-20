@@ -11,14 +11,18 @@ export const catalogRoutes = new Hono<AppEnv>();
 catalogRoutes.get("/categories", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
   const rows = await c.env.DB.prepare(
-    "SELECT id, name, sort_order FROM categories WHERE org_id = ? AND is_archived = 0 ORDER BY sort_order, name",
+    "SELECT id, name, sort_order, product_kind FROM categories WHERE org_id = ? AND is_archived = 0 ORDER BY sort_order, name",
   )
     .bind(auth.orgId)
-    .all<{ id: string; name: string; sort_order: number }>();
+    .all<{ id: string; name: string; sort_order: number; product_kind: string }>();
   return c.json({ categories: rows.results ?? [] });
 });
 
-const CategoryIn = z.object({ name: z.string().min(1), sortOrder: z.number().int().optional() });
+const CategoryIn = z.object({
+  name: z.string().min(1),
+  sortOrder: z.number().int().optional(),
+  productKind: z.enum(["cup", "item"]).optional(),
+});
 
 catalogRoutes.post("/categories", requireAuth(), requireManager(), async (c) => {
   const auth = c.get("auth")!;
@@ -26,9 +30,9 @@ catalogRoutes.post("/categories", requireAuth(), requireManager(), async (c) => 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   await c.env.DB.prepare(
-    "INSERT INTO categories (id, org_id, name, sort_order, created_at) VALUES (?, ?, ?, ?, ?)",
+    "INSERT INTO categories (id, org_id, name, sort_order, product_kind, created_at) VALUES (?, ?, ?, ?, ?, ?)",
   )
-    .bind(id, auth.orgId, body.name, body.sortOrder ?? 0, now)
+    .bind(id, auth.orgId, body.name, body.sortOrder ?? 0, body.productKind ?? "cup", now)
     .run();
   await writeAudit({ db: c.env.DB, orgId: auth.orgId, userId: auth.id, action: "category.create", entityId: id, payload: body });
   return c.json({ id });
@@ -111,7 +115,11 @@ catalogRoutes.get("/products/:productId/pos-detail", requireAuth(), async (c) =>
 catalogRoutes.patch("/categories/:id", requireAuth(), requireManager(), async (c) => {
   const auth = c.get("auth")!;
   const id = c.req.param("id");
-  const Body = z.object({ name: z.string().min(1).optional(), sortOrder: z.number().int().optional() });
+  const Body = z.object({
+    name: z.string().min(1).optional(),
+    sortOrder: z.number().int().optional(),
+    productKind: z.enum(["cup", "item"]).optional(),
+  });
   const body = Body.parse(await c.req.json());
   const sets: string[] = [];
   const vals: unknown[] = [];
@@ -122,6 +130,10 @@ catalogRoutes.patch("/categories/:id", requireAuth(), requireManager(), async (c
   if (body.sortOrder !== undefined) {
     sets.push("sort_order = ?");
     vals.push(body.sortOrder);
+  }
+  if (body.productKind !== undefined) {
+    sets.push("product_kind = ?");
+    vals.push(body.productKind);
   }
   if (!sets.length) return c.json({ error: "no_fields" }, 400);
   vals.push(id, auth.orgId);

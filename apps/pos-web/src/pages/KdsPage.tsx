@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
 
+type QueueLine = { qty: number; product_name: string };
 type QueueRow = {
   id: string;
   ticket_no?: number | null;
@@ -8,7 +9,9 @@ type QueueRow = {
   kds_state?: string;
   ticket_type?: string;
   parked_label?: string | null;
+  created_at?: string;
   updated_at?: string;
+  lines?: QueueLine[];
 };
 type TicketLine = {
   id: string;
@@ -19,62 +22,103 @@ type TicketLine = {
 };
 type TicketDetail = { ticket: QueueRow; lines: TicketLine[] };
 
+const KDS_POLL_MS = 5000;
+
+function formatTicketLabel(ticket: QueueRow) {
+  if (ticket.ticket_no && ticket.ticket_no > 0) return `#${String(ticket.ticket_no).padStart(4, "0")}`;
+  return String(ticket.parked_label ?? ticket.id).slice(0, 12);
+}
+
+function formatOrderDateTime(iso: string | undefined) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function kdsStateClass(state: string | undefined) {
+  if (state === "ready") return "kds-ready";
+  return "kds-preparing";
+}
+
+function kdsCardClass(ticket: QueueRow) {
+  if (ticket.status === "parked") return "kds-parked";
+  return kdsStateClass(ticket.kds_state);
+}
+
+function isParkedTicket(ticket: QueueRow) {
+  return ticket.status === "parked";
+}
+
 export function KdsPage() {
   const [rows, setRows] = useState<QueueRow[]>([]);
   const [selectedTicket, setSelectedTicket] = useState<TicketDetail | null>(null);
   const [busy, setBusy] = useState(false);
 
-  function formatTicketLabel(ticket: QueueRow) {
-    if (ticket.ticket_no && ticket.ticket_no > 0) return `#${String(ticket.ticket_no).padStart(4, "0")}`;
-    return String(ticket.parked_label ?? ticket.id).slice(0, 12);
-  }
-
-  function kdsStateClass(state: string | undefined) {
-    if (state === "ready") return "kds-ready";
-    return "kds-preparing";
-  }
-
-  async function loadQueue() {
+  const loadQueue = useCallback(async () => {
     const res = await api<{ tickets: QueueRow[] }>("/kds/queue");
-    setRows(res.tickets ?? []);
-  }
+    let tickets = res.tickets ?? [];
+    if (tickets.some((t) => !Array.isArray(t.lines))) {
+      tickets = await Promise.all(
+        tickets.map(async (ticket) => {
+          if (Array.isArray(ticket.lines)) return ticket;
+          try {
+            const detail = await api<TicketDetail>(`/kds/tickets/${ticket.id}`);
+            return {
+              ...ticket,
+              created_at: ticket.created_at ?? detail.ticket.created_at,
+              lines: detail.lines.map((line) => ({
+                qty: line.qty,
+                product_name: line.product_name ?? "Item",
+              })),
+            };
+          } catch {
+            return { ...ticket, lines: [] };
+          }
+        }),
+      );
+    }
+    setRows(tickets);
+  }, []);
 
   useEffect(() => {
+    if ("serviceWorker" in navigator) {
+      void navigator.serviceWorker.getRegistration().then((reg) => reg?.update()).catch(() => {});
+    }
     void loadQueue().catch(() => {});
-    const onVisible = () => {
-      if (document.visibilityState === "visible") void loadQueue().catch(() => {});
-    };
-    const onFocus = () => {
+    const refresh = () => {
       void loadQueue().catch(() => {});
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refresh();
     };
     document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onFocus);
-    const onKdsRefresh = () => {
-      void loadQueue().catch(() => {});
-    };
-    window.addEventListener("kds:refresh", onKdsRefresh as EventListener);
+    window.addEventListener("focus", refresh);
+    window.addEventListener("kds:refresh", refresh);
     const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("pos-live") : null;
     const onMessage = (ev: MessageEvent) => {
       const payload = ev.data as { type?: string };
-      if (payload?.type === "kds:refresh") {
-        void loadQueue().catch(() => {});
-      }
+      if (payload?.type === "kds:refresh") refresh();
     };
     if (channel) channel.addEventListener("message", onMessage);
-    const id = window.setInterval(() => {
-      void loadQueue().catch(() => {});
-    }, 1000);
+    const id = window.setInterval(refresh, KDS_POLL_MS);
     return () => {
       window.clearInterval(id);
       document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onFocus);
-      window.removeEventListener("kds:refresh", onKdsRefresh as EventListener);
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("kds:refresh", refresh);
       if (channel) {
         channel.removeEventListener("message", onMessage);
         channel.close();
       }
     };
-  }, []);
+  }, [loadQueue]);
 
   async function openTicket(ticketId: string) {
     const detail = await api<TicketDetail>(`/kds/tickets/${ticketId}`);
@@ -101,17 +145,40 @@ export function KdsPage() {
     <div className="page-shell" style={{ gap: 12 }}>
       <h1 className="page-title">Kitchen display</h1>
       <div className="grid-products">
-        {rows.map((t) => (
-          <button key={String(t.id)} className={`tile ${kdsStateClass(t.kds_state)}`} type="button" onClick={() => void openTicket(String(t.id))}>
-            <div style={{ fontWeight: 700 }}>{formatTicketLabel(t)}</div>
-            <div className="muted" style={{ marginTop: 8 }}>
-              {String(t.ticket_type)} · {String(t.status)}
-            </div>
-            <div className={`kds-badge ${kdsStateClass(t.kds_state)}`} style={{ marginTop: 8 }}>
-              KDS: {String(t.kds_state ?? "preparing")}
-            </div>
-          </button>
-        ))}
+        {rows.map((t) => {
+          const lines = t.lines ?? [];
+          const parked = isParkedTicket(t);
+          return (
+            <button
+              key={String(t.id)}
+              className={`tile kds-card ${kdsCardClass(t)}`}
+              type="button"
+              onClick={() => void openTicket(String(t.id))}
+            >
+              <div className="kds-card-top">
+                <div className="kds-card-number">{formatTicketLabel(t)}</div>
+                {parked ? <span className="kds-badge kds-parked">Parked</span> : null}
+              </div>
+              <div className="kds-card-datetime">{formatOrderDateTime(t.created_at) || "—"}</div>
+              <div className="kds-card-type">{String(t.ticket_type ?? "takeout").replace("_", " ")}</div>
+              <ul className="kds-card-lines" aria-label="Order items">
+                {lines.length ? (
+                  lines.map((line, idx) => (
+                    <li key={`${t.id}-${idx}`} className="kds-card-line">
+                      <span className="kds-card-line-qty">{line.qty}×</span>
+                      <span className="kds-card-line-name">{line.product_name}</span>
+                    </li>
+                  ))
+                ) : (
+                  <li className="kds-card-line muted">No items</li>
+                )}
+              </ul>
+              {!parked ? (
+                <div className={`kds-badge ${kdsStateClass(t.kds_state)}`}>KDS: {String(t.kds_state ?? "preparing")}</div>
+              ) : null}
+            </button>
+          );
+        })}
       </div>
       {selectedTicket ? (
         <div className="sheet" role="dialog">
@@ -123,12 +190,17 @@ export function KdsPage() {
               </button>
             </div>
             <div className="muted">
-              {String(selectedTicket.ticket.ticket_type ?? "takeout")} · POS: {String(selectedTicket.ticket.status)} · KDS:{" "}
+              {formatOrderDateTime(selectedTicket.ticket.created_at)} · {String(selectedTicket.ticket.ticket_type ?? "takeout")} · KDS:{" "}
               {String(selectedTicket.ticket.kds_state ?? "preparing")}
+              {isParkedTicket(selectedTicket.ticket) ? " · Parked" : ""}
             </div>
-            <div className={`kds-badge ${kdsStateClass(selectedTicket.ticket.kds_state)}`}>
-              {selectedTicket.ticket.kds_state === "ready" ? "Ready to serve" : "Preparing"}
-            </div>
+            {isParkedTicket(selectedTicket.ticket) ? (
+              <div className="kds-badge kds-parked">Parked</div>
+            ) : (
+              <div className={`kds-badge ${kdsStateClass(selectedTicket.ticket.kds_state)}`}>
+                {selectedTicket.ticket.kds_state === "ready" ? "Ready to serve" : "Preparing"}
+              </div>
+            )}
             <div className="stack" style={{ gap: 8 }}>
               {selectedTicket.lines.map((line) => (
                 <div key={line.id} className="row" style={{ justifyContent: "space-between" }}>
