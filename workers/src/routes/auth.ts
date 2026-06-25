@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../ctx.js";
 import { verifyPin } from "../crypto_pin.js";
+import { verifyManagerCredentials } from "../lib/manager_auth.js";
 import { clearSessionCookie, requireAuth, resolveSessionIdFromRequest, setSessionCookie } from "../middleware/session.js";
 import { writeAudit } from "../audit.js";
 import { buildCsrfToken } from "../lib/session_token.js";
@@ -122,4 +123,43 @@ authRoutes.get("/me", requireAuth(), async (c) => {
     },
     csrfToken,
   });
+});
+
+const VerifyOwnerPinSchema = z.object({ pin: z.string().min(4) });
+const VerifyManagerCredentialsSchema = z.object({
+  staffCode: z.string().min(1),
+  pin: z.string().min(4),
+});
+
+authRoutes.post("/verify-manager-credentials", requireAuth(), async (c) => {
+  const auth = c.get("auth")!;
+  const body = VerifyManagerCredentialsSchema.parse(await c.req.json());
+  const approver = await verifyManagerCredentials(c.env.DB, auth.orgId, body.staffCode, body.pin);
+  if (!approver) return c.json({ error: "invalid_manager_credentials" }, 401);
+  return c.json({
+    ok: true,
+    approver: {
+      id: approver.id,
+      role: approver.role,
+      displayName: approver.displayName,
+      staffCode: approver.staffCode,
+    },
+  });
+});
+
+authRoutes.post("/verify-owner-pin", requireAuth(), async (c) => {
+  const auth = c.get("auth")!;
+  const body = VerifyOwnerPinSchema.parse(await c.req.json());
+  const owners = await c.env.DB.prepare(
+    `SELECT pin_hash, salt FROM users WHERE org_id = ? AND role = 'owner' AND active = 1`,
+  )
+    .bind(auth.orgId)
+    .all<{ pin_hash: string; salt: string }>();
+
+  for (const owner of owners.results ?? []) {
+    const ok = await verifyPin(body.pin, owner.salt, owner.pin_hash);
+    if (ok) return c.json({ ok: true });
+  }
+
+  return c.json({ error: "invalid_owner_pin" }, 401);
 });

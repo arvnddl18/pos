@@ -152,6 +152,8 @@ analyticsRoutes.get("/trends/products", requireAuth(), requireManager(), async (
   const demoClause = demo ? `AND t.demographic_color = '${demo}'` : "";
   const dc = dateClause(dateFrom, dateTo, dateMonth, "t");
 
+  const limit = Math.min(Math.max(Number(c.req.query("limit")) || 50, 1), 200);
+
   const results = await c.env.DB.prepare(
     `SELECT pr.name, COALESCE(SUM(li.qty), 0) as sold_count,
        COALESCE(SUM(li.unit_price_centavos * li.qty - li.discount_centavos), 0) as revenue
@@ -160,10 +162,13 @@ analyticsRoutes.get("/trends/products", requireAuth(), requireManager(), async (
      JOIN products pr ON pr.id = li.product_id
      LEFT JOIN categories cat ON cat.id = pr.category_id
      WHERE t.org_id = ? AND t.status = 'paid' AND li.voided = 0
-       AND COALESCE(cat.product_kind, 'cup') = ? ${demoClause} ${dc}
-     GROUP BY pr.id, pr.name ORDER BY sold_count DESC LIMIT 10`,
+       AND (
+         (? = 'cup' AND COALESCE(cat.product_kind, 'cup') = 'cup') OR
+         (? = 'item' AND COALESCE(cat.product_kind, 'cup') != 'cup')
+       ) ${demoClause} ${dc}
+     GROUP BY pr.id, pr.name ORDER BY sold_count DESC LIMIT ?`,
   )
-    .bind(auth.orgId, kind)
+    .bind(auth.orgId, kind, kind, limit)
     .all();
 
   return c.json({ products: results.results ?? [], kind });

@@ -1,18 +1,25 @@
-import { FormEvent, useState } from "react";
+import { FormEvent } from "react";
 import { api } from "../api.js";
+import { emitToast } from "../ui/ToastProvider.js";
 
 export function ShiftsPage() {
-  const [msg, setMsg] = useState<string | null>(null);
-
   async function clockIn() {
-    const registerId = sessionStorage.getItem("registerId") ?? undefined;
-    await api("/shifts/clock-in", { method: "POST", json: registerId ? { registerId } : {} });
-    setMsg("Clocked in");
+    try {
+      const registerId = sessionStorage.getItem("registerId") ?? undefined;
+      await api("/shifts/clock-in", { method: "POST", json: registerId ? { registerId } : {} });
+      emitToast("success", "Clocked in");
+    } catch {
+      // API error toast handled by api()
+    }
   }
 
   async function clockOut() {
-    await api("/shifts/clock-out", { method: "POST", json: {} });
-    setMsg("Clocked out");
+    try {
+      await api("/shifts/clock-out", { method: "POST", json: {} });
+      emitToast("success", "Clocked out");
+    } catch {
+      // API error toast handled by api()
+    }
   }
 
   async function openDrawer(e: FormEvent<HTMLFormElement>) {
@@ -20,11 +27,15 @@ export function ShiftsPage() {
     const fd = new FormData(e.currentTarget);
     const registerId = String(fd.get("registerId") ?? "");
     const opening = Number(fd.get("opening") ?? "0");
-    await api("/shifts/drawer/open", {
-      method: "POST",
-      json: { registerId, openingFloatCentavos: Math.round(opening * 100) },
-    });
-    setMsg("Drawer opened");
+    try {
+      await api("/shifts/drawer/open", {
+        method: "POST",
+        json: { registerId, openingFloatCentavos: Math.round(opening * 100) },
+      });
+      emitToast("success", "Drawer opened");
+    } catch {
+      // API error toast handled by api()
+    }
   }
 
   return (
@@ -46,7 +57,6 @@ export function ShiftsPage() {
           Open
         </button>
       </form>
-      {msg ? <div className="muted">{msg}</div> : null}
     </div>
   );
 }

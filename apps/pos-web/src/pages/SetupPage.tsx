@@ -4,12 +4,10 @@ import { api } from "../api.js";
 
 export function SetupPage() {
   const navigate = useNavigate();
-  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    setError(null);
     const fd = new FormData(e.currentTarget);
     const organizationName = String(fd.get("organizationName") ?? "").trim();
     const locationName = String(fd.get("locationName") ?? "").trim();
@@ -32,8 +30,8 @@ export function SetupPage() {
         },
       });
       navigate("/login", { replace: true });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Setup failed");
+    } catch {
+      // API error toast handled by api()
     } finally {
       setLoading(false);
     }
@@ -70,7 +68,6 @@ export function SetupPage() {
           <div className="label">Owner PIN</div>
           <input className="field" name="ownerPin" type="password" required minLength={4} />
         </div>
-        {error ? <div className="error">{error}</div> : null}
         <button className="primary-btn" type="submit" disabled={loading}>
           {loading ? "Saving…" : "Create workspace"}
         </button>

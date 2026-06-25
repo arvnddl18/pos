@@ -8,11 +8,11 @@ export const kdsRoutes = new Hono<AppEnv>();
 kdsRoutes.get("/queue", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
   const rows = await c.env.DB.prepare(
-    `SELECT tk.id, tk.ticket_no, tk.status, COALESCE(tk.kds_state, 'preparing') AS kds_state, tk.ticket_type, tk.parked_label, tk.created_at, tk.updated_at,
+    `SELECT tk.id, tk.ticket_no, tk.status, COALESCE(tk.kds_state, 'preparing') AS kds_state, tk.ticket_type, tk.parked_label, tk.notes, tk.created_at, tk.updated_at,
             km.bump_order, km.station
      FROM tickets tk
      LEFT JOIN ticket_kds_meta km ON km.ticket_id = tk.id
-     WHERE tk.org_id = ? AND tk.status IN ('open','parked') AND COALESCE(tk.kds_state, 'preparing') != 'served'
+     WHERE tk.org_id = ? AND tk.status IN ('open','parked','paid') AND COALESCE(tk.kds_state, 'preparing') != 'served'
        AND EXISTS (SELECT 1 FROM line_items li WHERE li.ticket_id = tk.id AND li.voided = 0)
      ORDER BY tk.created_at ASC`,
   )
@@ -22,19 +22,27 @@ kdsRoutes.get("/queue", requireAuth(), async (c) => {
   if (tickets.length === 0) return c.json({ tickets: [] });
 
   const ids = tickets.map((t) => t.id);
-  const placeholders = ids.map(() => "?").join(",");
-  const lineRows = await c.env.DB.prepare(
-    `SELECT li.ticket_id, li.qty, p.name AS product_name
-     FROM line_items li
-     JOIN products p ON p.id = li.product_id
-     WHERE li.ticket_id IN (${placeholders}) AND li.voided = 0
-     ORDER BY li.sort_order`,
-  )
-    .bind(...ids)
-    .all<{ ticket_id: string; qty: number; product_name: string }>();
+  const lineRows = [];
+  const chunkSize = 50;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => "?").join(",");
+    const res = await c.env.DB.prepare(
+      `SELECT li.ticket_id, li.qty, p.name AS product_name
+       FROM line_items li
+       JOIN products p ON p.id = li.product_id
+       WHERE li.ticket_id IN (${placeholders}) AND li.voided = 0
+       ORDER BY li.sort_order`,
+    )
+      .bind(...chunk)
+      .all<{ ticket_id: string; qty: number; product_name: string }>();
+    if (res.results) {
+      lineRows.push(...res.results);
+    }
+  }
 
   const linesByTicket = new Map<string, Array<{ qty: number; product_name: string }>>();
-  for (const line of lineRows.results ?? []) {
+  for (const line of lineRows) {
     const ticketId = String(line.ticket_id);
     const bucket = linesByTicket.get(ticketId) ?? [];
     bucket.push({ qty: Number(line.qty), product_name: String(line.product_name) });
@@ -53,7 +61,7 @@ kdsRoutes.get("/tickets/:ticketId", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
   const ticketId = c.req.param("ticketId");
   const ticket = await c.env.DB.prepare(
-    `SELECT tk.id, tk.ticket_no, tk.status, COALESCE(tk.kds_state, 'preparing') AS kds_state, tk.ticket_type, tk.parked_label, tk.created_at, tk.updated_at,
+    `SELECT tk.id, tk.ticket_no, tk.status, COALESCE(tk.kds_state, 'preparing') AS kds_state, tk.ticket_type, tk.parked_label, tk.notes, tk.created_at, tk.updated_at,
             km.bump_order, km.station
      FROM tickets tk
      LEFT JOIN ticket_kds_meta km ON km.ticket_id = tk.id
@@ -87,7 +95,7 @@ kdsRoutes.patch("/tickets/:ticketId/state", requireAuth(), async (c) => {
   const res = await c.env.DB.prepare(
     `UPDATE tickets
      SET kds_state = ?, updated_at = ?
-     WHERE id = ? AND org_id = ? AND status IN ('open','parked')`,
+     WHERE id = ? AND org_id = ? AND status IN ('open','parked','paid')`,
   )
     .bind(body.state, now, ticketId, auth.orgId)
     .run();

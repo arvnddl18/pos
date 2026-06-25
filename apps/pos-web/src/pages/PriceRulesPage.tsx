@@ -1,5 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { api, formatPhp } from "../api.js";
+import { emitToast } from "../ui/ToastProvider.js";
+import { useInputDialogs } from "../ui/useInputDialogs.js";
 
 type Product = {
   id: string;
@@ -66,8 +68,8 @@ export function PriceRulesPage() {
   const [products, setProducts] = useState<Product[]>([]);
   const [productFilter, setProductFilter] = useState("");
   const [selectedDays, setSelectedDays] = useState<number[]>([]);
-  const [msg, setMsg] = useState<string | null>(null);
   const [removingId, setRemovingId] = useState<string | null>(null);
+  const { confirm, inputDialogs } = useInputDialogs();
 
   async function load() {
     const [rulesRes, productsRes] = await Promise.all([
@@ -110,15 +112,20 @@ export function PriceRulesPage() {
   async function removeRule(rule: PriceRule) {
     const product = rule.product_id ? productById.get(rule.product_id) : undefined;
     const label = product?.name ?? "this rule";
-    if (!window.confirm(`Remove happy hour price for ${label}? The product will use its regular price on POS.`)) return;
-    setMsg(null);
+    const ok = await confirm({
+      title: "Remove price rule",
+      message: `Remove happy hour price for ${label}? The product will use its regular price on POS.`,
+      confirmLabel: "Remove",
+      danger: true,
+    });
+    if (!ok) return;
     setRemovingId(rule.id);
     try {
       await api(`/price-rules/${rule.id}`, { method: "DELETE", json: {} });
-      setMsg("Rule removed.");
+      emitToast("success", "Price rule removed.");
       await load();
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Could not remove rule.");
+    } catch {
+      // API error toast handled by api()
     } finally {
       setRemovingId(null);
     }
@@ -126,24 +133,23 @@ export function PriceRulesPage() {
 
   async function createRule(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    setMsg(null);
     const fd = new FormData(e.currentTarget);
     const productId = String(fd.get("productId") || "");
     const price = Number(fd.get("price") ?? "0");
     const startsRaw = String(fd.get("startsAt") || "");
     const endsRaw = String(fd.get("endsAt") || "");
     if (!productId) {
-      setMsg("Choose a product.");
+      emitToast("warning", "Choose a product.");
       return;
     }
     if (!startsRaw || !endsRaw) {
-      setMsg("Set both start and end date/time for when the happy hour applies.");
+      emitToast("warning", "Set both start and end date/time for when the happy hour applies.");
       return;
     }
     const startsAt = new Date(startsRaw).toISOString();
     const endsAt = new Date(endsRaw).toISOString();
     if (new Date(endsAt).getTime() <= new Date(startsAt).getTime()) {
-      setMsg("End must be after start.");
+      emitToast("warning", "End must be after start.");
       return;
     }
     try {
@@ -161,10 +167,10 @@ export function PriceRulesPage() {
       e.currentTarget.reset();
       setProductFilter("");
       setSelectedDays([]);
-      setMsg("Happy hour price added.");
+      emitToast("success", "Happy hour price added.");
       await load();
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Could not save rule.");
+    } catch {
+      // API error toast handled by api()
     }
   }
 
@@ -231,7 +237,6 @@ export function PriceRulesPage() {
         <button className="primary-btn" type="submit" disabled={filteredProducts.length === 0}>
           Add rule
         </button>
-        {msg ? <div className="muted">{msg}</div> : null}
       </form>
 
       <div className="card stack">
@@ -284,6 +289,7 @@ export function PriceRulesPage() {
           </div>
         )}
       </div>
+      {inputDialogs}
     </div>
   );
 }

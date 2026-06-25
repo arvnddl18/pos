@@ -1,5 +1,8 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { api, formatPhp } from "../api.js";
+import { emitToast } from "../ui/ToastProvider.js";
+import { useInputDialogs } from "../ui/useInputDialogs.js";
+import { ManagerPinCancelledError, useManagerPinConfirm } from "../ui/useManagerPinConfirm.js";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line,
@@ -9,21 +12,147 @@ import { saveAs } from "file-saver";
 
 const DEMOGRAPHICS = [
   { value: "", label: "All Profiles" },
-  { value: "blue",   label: "🔵 Blue — Student" },
-  { value: "green",  label: "🟢 Green — Professional" },
-  { value: "red",    label: "🔴 Red — Family" },
+  { value: "blue", label: "🔵 Blue — Student" },
+  { value: "green", label: "🟢 Green — Professional" },
+  { value: "red", label: "🔴 Red — Family" },
   { value: "yellow", label: "🟡 Yellow — Senior" },
   { value: "purple", label: "🟣 Purple — Tourist" },
   { value: "orange", label: "🟠 Orange — Couple" },
-  { value: "pink",   label: "🩷 Pink — Teenager" },
-  { value: "brown",  label: "🟤 Brown — Group" },
+  { value: "pink", label: "🩷 Pink — Teenager" },
+  { value: "brown", label: "🟤 Brown — Group" },
 ];
 
 const DEMO_COLORS: Record<string, string> = {
   blue: "#3b82f6", green: "#22c55e", red: "#ef4444", yellow: "#eab308",
   purple: "#a855f7", orange: "#f97316", pink: "#ec4899", brown: "#92400e",
 };
-const CHART_COLORS = ["#ee8a2f","#3b82f6","#22c55e","#ef4444","#a855f7","#eab308","#ec4899","#92400e"];
+const CHART_COLORS = ["#ee8a2f", "#3b82f6", "#22c55e", "#ef4444", "#a855f7", "#eab308", "#ec4899", "#92400e"];
+
+function parseAuditPayload(payloadJson: unknown): Record<string, unknown> {
+  if (!payloadJson) return {};
+  if (typeof payloadJson === "object") return payloadJson as Record<string, unknown>;
+  try {
+    return JSON.parse(String(payloadJson)) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function lineVoidDetails(ev: Record<string, unknown>) {
+  const payload = parseAuditPayload(ev.payload_json);
+  const productName = String(ev.line_product_name ?? payload.productName ?? "Item");
+  const qty = Number(ev.line_qty ?? payload.qty ?? 0);
+  const unit = Number(ev.line_unit_price_centavos ?? payload.unitPriceCentavos ?? 0);
+  const discount = Number(ev.line_discount_centavos ?? payload.discountCentavos ?? 0);
+  const amountCentavos = Math.max(0, qty * unit - discount);
+  const reason = String(ev.line_void_reason ?? payload.reason ?? "").trim();
+  const ticketId = String(ev.line_ticket_id ?? payload.ticketId ?? "");
+  return { productName, qty, unit, discount, amountCentavos, reason, ticketId };
+}
+
+function productUpdateDetails(ev: Record<string, unknown>) {
+  const payload = parseAuditPayload(ev.payload_json);
+  const productName = String(payload.name ?? ev.audit_product_name ?? "Product");
+  const fieldLabels: Record<string, string> = {
+    name: "Name",
+    description: "Description",
+    categoryId: "Category",
+    priceCentavos: "Price",
+    taxProfileId: "Tax profile",
+    imageR2Key: "Image",
+    sku: "SKU",
+    barcode: "Barcode",
+    isRetail: "Retail",
+    namesI18n: "Translations",
+    isActive: "Active",
+    outOfStock: "Out of stock",
+  };
+  const changes = Object.entries(payload).map(([key, value]) => ({
+    key,
+    label: fieldLabels[key] ?? key,
+    value,
+  }));
+  return { productName, changes };
+}
+
+function productCreateDetails(ev: Record<string, unknown>) {
+  const payload = parseAuditPayload(ev.payload_json);
+  const productName = String(payload.name ?? ev.audit_product_name ?? "Product");
+  const fieldLabels: Record<string, string> = {
+    name: "Name",
+    description: "Description",
+    categoryId: "Category",
+    priceCentavos: "Price",
+    taxProfileId: "Tax profile",
+    imageR2Key: "Image",
+    sku: "SKU",
+    barcode: "Barcode",
+    isRetail: "Retail",
+    namesI18n: "Translations",
+  };
+  const fields = Object.entries(payload)
+    .filter(([key]) => key in fieldLabels)
+    .map(([key, value]) => ({
+      key,
+      label: fieldLabels[key] ?? key,
+      value,
+    }));
+  if (!fields.length && ev.audit_product_name) {
+    fields.push({ key: "name", label: "Name", value: ev.audit_product_name });
+    if (ev.audit_product_price_centavos != null) {
+      fields.push({ key: "priceCentavos", label: "Price", value: ev.audit_product_price_centavos });
+    }
+    if (ev.audit_product_sku) fields.push({ key: "sku", label: "SKU", value: ev.audit_product_sku });
+    if (ev.audit_product_barcode) fields.push({ key: "barcode", label: "Barcode", value: ev.audit_product_barcode });
+  }
+  return { productName, fields };
+}
+
+function ticketRefundDetails(ev: Record<string, unknown>) {
+  const payload = parseAuditPayload(ev.payload_json);
+  return {
+    ticketId: String(ev.entity_id ?? ""),
+    ticketNo: Number(ev.ticket_no ?? payload.ticketNo ?? 0) || null,
+    amountCentavos: Number(payload.amountCentavos ?? ev.audit_refund_amount_centavos ?? 0),
+    reason: String(payload.reason ?? ev.audit_refund_reason ?? "").trim(),
+    note: String(payload.note ?? ev.audit_refund_note ?? "").trim(),
+  };
+}
+
+function ticketParkedDetails(ev: Record<string, unknown>) {
+  const payload = parseAuditPayload(ev.payload_json);
+  return {
+    ticketId: String(ev.entity_id ?? ""),
+    parkedLabel: String(payload.parkedLabel ?? ev.ticket_parked_label ?? "").trim(),
+  };
+}
+
+function ticketResumedDetails(ev: Record<string, unknown>) {
+  return {
+    ticketId: String(ev.entity_id ?? ""),
+    parkedLabel: String(ev.ticket_parked_label ?? "").trim(),
+  };
+}
+
+function staffCreateDetails(ev: Record<string, unknown>) {
+  const payload = parseAuditPayload(ev.payload_json);
+  return {
+    staffCode: String(payload.staffCode ?? ev.audit_staff_code ?? ""),
+    displayName: String(payload.displayName ?? ev.audit_staff_display_name ?? ""),
+    role: String(payload.role ?? ev.audit_staff_role ?? ""),
+  };
+}
+
+function categoryCreateDetails(ev: Record<string, unknown>) {
+  const payload = parseAuditPayload(ev.payload_json);
+  const kindLabels: Record<string, string> = { cup: "Cup / drink", item: "Retail item" };
+  return {
+    name: String(payload.name ?? ev.audit_category_name ?? "Category"),
+    sortOrder: payload.sortOrder ?? 0,
+    productKind: String(payload.productKind ?? "cup"),
+    productKindLabel: kindLabels[String(payload.productKind ?? "cup")] ?? String(payload.productKind ?? "cup"),
+  };
+}
 
 type Kpi = {
   totalTickets: number; totalRevenueCentavos: number; avgOrderValueCentavos: number; totalCupsSold: number;
@@ -59,77 +188,243 @@ function TopProductsPanel({
   emptyLabel: string;
   ct: { grid: string; axis: string; bg: string };
 }) {
+  const [showAll, setShowAll] = useState(false);
+
   return (
-    <div className="card stack" style={{ flex: "1 1 320px", gap: 10 }}>
-      <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>{title}</h3>
-      {products.length === 0 ? (
-        <div className="muted" style={{ fontSize: 13 }}>{emptyLabel}</div>
-      ) : (
-        <>
-          <div className="stack" style={{ gap: 6 }}>
-            {products.slice(0, 5).map((p, i) => (
-              <div
-                key={`${p.name}-${i}`}
-                className="row"
+    <>
+      <div className="card stack" style={{ flex: "1 1 320px", gap: 10 }}>
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+          <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>{title}</h3>
+          {products.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowAll(true)}
+              style={{
+                background: "none",
+                border: "1.5px solid var(--accent)",
+                color: "var(--accent-strong)",
+                fontWeight: 700,
+                fontSize: 11,
+                padding: "4px 12px",
+                borderRadius: 8,
+                cursor: "pointer",
+                letterSpacing: "0.03em",
+                transition: "background 0.15s, color 0.15s",
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "var(--accent)"; e.currentTarget.style.color = "#fff"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "none"; e.currentTarget.style.color = "var(--accent-strong)"; }}
+            >
+              View All ({products.length})
+            </button>
+          )}
+        </div>
+        {products.length === 0 ? (
+          <div className="muted" style={{ fontSize: 13 }}>{emptyLabel}</div>
+        ) : (
+          <>
+            <div className="stack" style={{ gap: 6 }}>
+              {products.slice(0, 5).map((p, i) => (
+                <div
+                  key={`${p.name}-${i}`}
+                  className="row"
+                  style={{
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    padding: "8px 12px",
+                    background: "var(--bg)",
+                    borderRadius: 8,
+                    border: "1px solid var(--border)",
+                  }}
+                >
+                  <div className="row" style={{ gap: 8, alignItems: "center", flex: 1, minWidth: 0 }}>
+                    <span style={{ fontWeight: 700, fontSize: 11, color: "var(--muted)", minWidth: 18 }}>#{i + 1}</span>
+                    <span
+                      style={{
+                        fontWeight: 600,
+                        color: "var(--text)",
+                        fontSize: 13,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {p.name}
+                    </span>
+                  </div>
+                  <div className="row" style={{ gap: 10, flexShrink: 0 }}>
+                    <span style={{ fontWeight: 700, color: "var(--accent-strong)", fontSize: 13 }}>
+                      {Number(p.sold_count).toLocaleString()} {unitLabel}
+                    </span>
+                    <span className="muted" style={{ fontSize: 11 }}>{formatPhp(Number(p.revenue))}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <ResponsiveContainer width="100%" height={150}>
+              <BarChart data={products.slice(0, 6)} layout="vertical" margin={{ left: 0, right: 8, top: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} />
+                <XAxis type="number" stroke={ct.axis} tick={{ fontSize: 10 }} allowDecimals={false} />
+                <YAxis type="category" dataKey="name" stroke={ct.axis} tick={{ fontSize: 10 }} width={100} />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: ct.bg,
+                    border: `1px solid ${ct.grid}`,
+                    borderRadius: 10,
+                    color: "var(--text)",
+                    fontSize: 12,
+                  }}
+                  formatter={(v) => [Number(v ?? 0).toLocaleString(), unitLabel]}
+                />
+                <Bar
+                  dataKey="sold_count"
+                  name={unitLabel}
+                  fill={demo ? DEMO_COLORS[demo] ?? "var(--accent)" : "var(--accent)"}
+                  radius={[0, 4, 4, 0]}
+                />
+              </BarChart>
+            </ResponsiveContainer>
+          </>
+        )}
+      </div>
+
+      {/* View All Modal */}
+      {showAll && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 9999,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(0,0,0,0.5)",
+            backdropFilter: "blur(4px)",
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) setShowAll(false); }}
+        >
+          <div
+            className="card stack"
+            style={{
+              width: "90vw",
+              maxWidth: 640,
+              maxHeight: "85vh",
+              gap: 14,
+              padding: "24px 28px",
+              overflow: "hidden",
+              display: "flex",
+              flexDirection: "column",
+              boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
+              borderRadius: 16,
+            }}
+          >
+            {/* Modal Header */}
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+              <h3 style={{ margin: 0, fontWeight: 800, fontSize: 17, color: "var(--text)" }}>{title}</h3>
+              <button
+                type="button"
+                onClick={() => setShowAll(false)}
                 style={{
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  padding: "8px 12px",
-                  background: "var(--bg)",
-                  borderRadius: 8,
+                  background: "var(--bg-elevated)",
                   border: "1px solid var(--border)",
+                  color: "var(--text)",
+                  fontWeight: 700,
+                  fontSize: 14,
+                  width: 32,
+                  height: 32,
+                  borderRadius: 8,
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  lineHeight: 1,
                 }}
               >
-                <div className="row" style={{ gap: 8, alignItems: "center", flex: 1, minWidth: 0 }}>
-                  <span style={{ fontWeight: 700, fontSize: 11, color: "var(--muted)", minWidth: 18 }}>#{i + 1}</span>
-                  <span
+                ✕
+              </button>
+            </div>
+
+            <div className="muted" style={{ fontSize: 12 }}>
+              Showing all {products.length} products · Total {unitLabel}: {products.reduce((s, p) => s + Number(p.sold_count), 0).toLocaleString()} · Total revenue: {formatPhp(products.reduce((s, p) => s + Number(p.revenue), 0))}
+            </div>
+
+            {/* Scrollable product list */}
+            <div style={{ overflowY: "auto", flex: 1, minHeight: 0 }}>
+              <div className="stack" style={{ gap: 5 }}>
+                {products.map((p, i) => (
+                  <div
+                    key={`${p.name}-${i}`}
+                    className="row"
                     style={{
-                      fontWeight: 600,
-                      color: "var(--text)",
-                      fontSize: 13,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      padding: "8px 12px",
+                      background: i < 3 ? "var(--accent-muted, rgba(238,138,47,0.08))" : "var(--bg)",
+                      borderRadius: 8,
+                      border: `1px solid ${i < 3 ? "var(--accent, #ee8a2f)" : "var(--border)"}`,
+                      borderLeftWidth: i < 3 ? 3 : 1,
                     }}
                   >
-                    {p.name}
-                  </span>
-                </div>
-                <div className="row" style={{ gap: 10, flexShrink: 0 }}>
-                  <span style={{ fontWeight: 700, color: "var(--accent-strong)", fontSize: 13 }}>
-                    {Number(p.sold_count).toLocaleString()} {unitLabel}
-                  </span>
-                  <span className="muted" style={{ fontSize: 11 }}>{formatPhp(Number(p.revenue))}</span>
-                </div>
+                    <div className="row" style={{ gap: 8, alignItems: "center", flex: 1, minWidth: 0 }}>
+                      <span style={{
+                        fontWeight: 700,
+                        fontSize: 11,
+                        color: i < 3 ? "var(--accent-strong)" : "var(--muted)",
+                        minWidth: 24,
+                      }}>
+                        #{i + 1}
+                      </span>
+                      <span
+                        style={{
+                          fontWeight: 600,
+                          color: "var(--text)",
+                          fontSize: 13,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {p.name}
+                      </span>
+                    </div>
+                    <div className="row" style={{ gap: 10, flexShrink: 0 }}>
+                      <span style={{ fontWeight: 700, color: "var(--accent-strong)", fontSize: 13 }}>
+                        {Number(p.sold_count).toLocaleString()} {unitLabel}
+                      </span>
+                      <span className="muted" style={{ fontSize: 11 }}>{formatPhp(Number(p.revenue))}</span>
+                    </div>
+                  </div>
+                ))}
               </div>
-            ))}
+            </div>
+
+            {/* Expanded chart */}
+            <ResponsiveContainer width="100%" height={Math.min(products.length * 28 + 20, 300)}>
+              <BarChart data={products} layout="vertical" margin={{ left: 0, right: 8, top: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} />
+                <XAxis type="number" stroke={ct.axis} tick={{ fontSize: 10 }} allowDecimals={false} />
+                <YAxis type="category" dataKey="name" stroke={ct.axis} tick={{ fontSize: 10 }} width={110} />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: ct.bg,
+                    border: `1px solid ${ct.grid}`,
+                    borderRadius: 10,
+                    color: "var(--text)",
+                    fontSize: 12,
+                  }}
+                  formatter={(v) => [Number(v ?? 0).toLocaleString(), unitLabel]}
+                />
+                <Bar
+                  dataKey="sold_count"
+                  name={unitLabel}
+                  fill={demo ? DEMO_COLORS[demo] ?? "var(--accent)" : "var(--accent)"}
+                  radius={[0, 4, 4, 0]}
+                />
+              </BarChart>
+            </ResponsiveContainer>
           </div>
-          <ResponsiveContainer width="100%" height={150}>
-            <BarChart data={products.slice(0, 6)} layout="vertical" margin={{ left: 0, right: 8, top: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} />
-              <XAxis type="number" stroke={ct.axis} tick={{ fontSize: 10 }} allowDecimals={false} />
-              <YAxis type="category" dataKey="name" stroke={ct.axis} tick={{ fontSize: 10 }} width={100} />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: ct.bg,
-                  border: `1px solid ${ct.grid}`,
-                  borderRadius: 10,
-                  color: "var(--text)",
-                  fontSize: 12,
-                }}
-                formatter={(v) => [Number(v ?? 0).toLocaleString(), unitLabel]}
-              />
-              <Bar
-                dataKey="sold_count"
-                name={unitLabel}
-                fill={demo ? DEMO_COLORS[demo] ?? "var(--accent)" : "var(--accent)"}
-                radius={[0, 4, 4, 0]}
-              />
-            </BarChart>
-          </ResponsiveContainer>
-        </>
+        </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -148,14 +443,14 @@ export function ReportsPage() {
 
   const activeDateLabel = dateType === "all" ? "" :
     dateType === "day" ? dateDay :
-    dateType === "range" ? `${dateFrom} → ${dateTo}` :
-    dateMonth;
+      dateType === "range" ? `${dateFrom} → ${dateTo}` :
+        dateMonth;
 
   function buildDateQ() {
     if (dateType === "day") return `&dateFrom=${dateDay}&dateTo=${dateDay}`;
     if (dateType === "range") return `&dateFrom=${dateFrom}&dateTo=${dateTo}`;
     if (dateType === "month") return `&dateMonth=${dateMonth}`;
-    return "";
+    return "&allTime=1";
   }
 
   const [eodData, setEodData] = useState<Record<string, unknown> | null>(null);
@@ -171,6 +466,15 @@ export function ReportsPage() {
   const [auditTicketDetail, setAuditTicketDetail] = useState<any | null>(null);
   const [auditTicketLoading, setAuditTicketLoading] = useState(false);
   const [auditTicketError, setAuditTicketError] = useState<string | null>(null);
+  const [auditLineVoidDetail, setAuditLineVoidDetail] = useState<any | null>(null);
+  const [auditProductDetail, setAuditProductDetail] = useState<any | null>(null);
+  const [auditRefundDetail, setAuditRefundDetail] = useState<any | null>(null);
+  const [auditParkedDetail, setAuditParkedDetail] = useState<any | null>(null);
+  const [auditStaffDetail, setAuditStaffDetail] = useState<any | null>(null);
+  const [auditCategoryDetail, setAuditCategoryDetail] = useState<any | null>(null);
+  const [auditRefundTicketId, setAuditRefundTicketId] = useState<string | null>(null);
+  const { prompt, inputDialogs } = useInputDialogs();
+  const { confirmManagerPin, managerPinModal } = useManagerPinConfirm();
   const [kpi, setKpi] = useState<Kpi | null>(null);
   const [demographics, setDemographics] = useState<any[]>([]);
   const [orderTypes, setOrderTypes] = useState<any[]>([]);
@@ -187,8 +491,8 @@ export function ReportsPage() {
 
   function refreshEod() {
     const dq = buildDateQ();
-    api<Record<string, unknown>>(`/reports/eod?x=1${dq}`).then(setEodData).catch(() => setEodData(null));
-    api<Record<string, unknown>>(`/reports/bir?x=1${dq}`).then(r => { setBirData(r); setBirPage(1); }).catch(() => setBirData(null));
+    api<Record<string, unknown>>(`/reports/eod?x=1${demoQ}${dq}`).then(setEodData).catch(() => setEodData(null));
+    api<Record<string, unknown>>(`/reports/bir?x=1${demoQ}${dq}`).then(r => { setBirData(r); setBirPage(1); }).catch(() => setBirData(null));
   }
   function refreshAudit() {
     const dq = buildDateQ();
@@ -211,12 +515,30 @@ export function ReportsPage() {
       if (auditActionFilter !== "all" && String(ev.action) !== auditActionFilter) return false;
       if (auditUserFilter !== "all" && String(ev.user_name ?? "System") !== auditUserFilter) return false;
       if (!q) return true;
+      const lineVoid = ev.action === "line.void" ? lineVoidDetails(ev) : null;
+      const ticketRefund = ev.action === "ticket.refund" ? ticketRefundDetails(ev) : null;
+      const ticketParked = ev.action === "ticket.parked" ? ticketParkedDetails(ev) : null;
+      const productCreate = ev.action === "product.create" ? productCreateDetails(ev) : null;
+      const staffCreate = ev.action === "staff.create" ? staffCreateDetails(ev) : null;
+      const categoryCreate = ev.action === "category.create" ? categoryCreateDetails(ev) : null;
       const haystack = [
         ev.action,
         ev.entity_type,
         ev.entity_id,
         ev.ticket_no,
         ev.ticket_no ? `#${String(ev.ticket_no).padStart(4, "0")}` : "",
+        ev.line_product_name,
+        lineVoid ? `${lineVoid.qty}× ${lineVoid.productName}` : "",
+        lineVoid ? formatPhp(lineVoid.amountCentavos) : "",
+        ticketRefund ? formatPhp(ticketRefund.amountCentavos) : "",
+        ticketRefund?.reason,
+        ticketParked?.parkedLabel,
+        ev.ticket_parked_label,
+        productCreate?.productName,
+        staffCreate?.staffCode,
+        staffCreate?.displayName,
+        staffCreate?.role,
+        categoryCreate?.name,
         ev.user_name ?? "System",
         new Date(String(ev.created_at)).toLocaleString(),
       ]
@@ -305,44 +627,85 @@ export function ReportsPage() {
     e.preventDefault();
     if (!feedbackModalTicketId) return;
     const fd = new FormData(e.currentTarget);
-    await api(`/tickets/${feedbackModalTicketId}/meta`, { method: "PATCH", json: { feedbackRating: Number(fd.get("rating")), feedbackNotes: String(fd.get("notes")) } });
-    setFeedbackModalTicketId(null);
-    if (tab === "feedback") refreshFeedback();
-    alert("Feedback saved!");
+    try {
+      await api(`/tickets/${feedbackModalTicketId}/meta`, { method: "PATCH", json: { feedbackRating: Number(fd.get("rating")), feedbackNotes: String(fd.get("notes")) } });
+      setFeedbackModalTicketId(null);
+      if (tab === "feedback") refreshFeedback();
+      emitToast("success", "Feedback saved.");
+    } catch (err) {
+      emitToast("error", err instanceof Error ? err.message : "Failed to save feedback.");
+    }
   }
 
   async function handleVoid(ticketId: string) {
-    const reason = window.prompt("Void entire ticket? Type reason:");
+    const reason = await prompt({
+      title: "Void ticket",
+      message: "Void entire ticket? Enter a reason.",
+      placeholder: "Reason for void",
+      required: true,
+      confirmLabel: "Continue",
+    });
     if (!reason) return;
     try {
-      await api(`/tickets/${ticketId}/void-ticket`, { method: "POST", json: { reason } });
+      await confirmManagerPin({
+        title: "Approve void",
+        description: "Manager or owner approval required to void this ticket.",
+        action: async ({ staffCode, pin }) => {
+          await api(`/tickets/${ticketId}/void-ticket`, {
+            method: "POST",
+            json: { reason, approverStaffCode: staffCode, approverPin: pin },
+          });
+        },
+      });
       refreshAudit();
-      alert("Ticket voided successfully.");
-    } catch (e: any) {
-      alert("Failed to void ticket: " + e.message);
+      emitToast("success", "Ticket voided successfully.");
+    } catch (e: unknown) {
+      if (e instanceof ManagerPinCancelledError) return;
+      emitToast("error", e instanceof Error ? e.message : "Failed to void ticket.");
     }
   }
 
   async function handleRefund(ticketId: string) {
-    const pesosStr = window.prompt("Refund Amount (PHP):");
-    if (!pesosStr) return;
-    const pesos = Number(pesosStr);
-    if (isNaN(pesos) || pesos <= 0) {
-      alert("Invalid amount.");
+    setAuditRefundTicketId(ticketId);
+  }
+
+  async function submitAuditRefund(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!auditRefundTicketId) return;
+    const fd = new FormData(e.currentTarget);
+    const pesos = Number(fd.get("amount"));
+    if (Number.isNaN(pesos) || pesos <= 0) {
+      emitToast("error", "Enter a valid refund amount.");
       return;
     }
-    const reason = window.prompt("Refund Reason:") || "Customer request";
+    const reason = String(fd.get("reason") ?? "").trim() || "Customer request";
+    const amountCentavos = Math.round(pesos * 100);
+    const ticketId = auditRefundTicketId;
     try {
-      await api(`/tickets/${ticketId}/refunds`, {
-        method: "POST",
-        json: { amountCentavos: Math.round(pesos * 100), reason, note: "Refunded from Audit log" }
+      await confirmManagerPin({
+        title: "Approve refund",
+        description: `Manager or owner approval required to refund ${formatPhp(amountCentavos)}.`,
+        action: async ({ staffCode, pin }) => {
+          await api(`/tickets/${ticketId}/refunds`, {
+            method: "POST",
+            json: {
+              amountCentavos,
+              reason,
+              note: "Refunded from Audit log",
+              approverStaffCode: staffCode,
+              approverPin: pin,
+            },
+          });
+        },
       });
+      setAuditRefundTicketId(null);
       refreshAudit();
       refreshEod();
       window.dispatchEvent(new CustomEvent("pos:data-changed"));
-      alert("Refund recorded successfully.");
-    } catch (e: any) {
-      alert("Failed to refund: " + e.message);
+      emitToast("success", "Refund recorded successfully.");
+    } catch (e: unknown) {
+      if (e instanceof ManagerPinCancelledError) return;
+      emitToast("error", e instanceof Error ? e.message : "Failed to refund.");
     }
   }
 
@@ -367,30 +730,32 @@ export function ReportsPage() {
 
   async function downloadIncomeSummaryXlsx() {
     if (!eodData) {
-      alert("No data available to export.");
+      emitToast("error", "No data available to export.");
       return;
     }
-    
+
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet("Income Summary");
-    
+
     ws.columns = [
       { header: "Metric", key: "metric", width: 35 },
       { header: "Value", key: "value", width: 20 },
     ];
-    
+
     ws.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
     ws.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4F81BD" } };
 
     const c = (val: any) => (Number(val) || 0) / 100;
-    
+
     const data = [
       { metric: "Gross Sales", value: c(eodData.grossSalesCentavos) },
-      { metric: "Less: Discounts", value: -c(eodData.discountsCentavos) },
+      { metric: "Less: Line Discounts", value: -c(eodData.discountOnlyCentavos) },
+      { metric: "Less: Order Discounts", value: -c(eodData.orderDiscountCentavos) },
       { metric: "Less: Marketing Expense", value: -c(eodData.marketingExpenseCentavos) },
       { metric: "Total Discounts", value: -c(eodData.totalDiscountsCentavos) },
       { metric: "Net Sales", value: c(eodData.netSalesCentavos) },
       { metric: "Less: Refunds / Returns", value: -c(eodData.refundsCentavos) },
+      { metric: "Add: Service Charge", value: c(eodData.serviceChargeCentavos) },
       { metric: "Adjusted Net Revenue", value: c(eodData.adjustedNetCentavos) },
       { metric: "Adjusted Net After Marketing", value: c(eodData.adjustedAfterMarketingCentavos) },
       {},
@@ -399,6 +764,7 @@ export function ReportsPage() {
       { metric: "VAT-Exempt Sales", value: 0 },
       { metric: "Zero-Rated Sales", value: 0 },
       {},
+      { metric: "Tips Collected", value: c(eodData.tipCentavos) },
       { metric: "Cash", value: c(eodData.cashCentavos) },
       { metric: "E-Wallet", value: c(eodData.ewalletCentavos) },
       { metric: "Total Collected", value: c(eodData.totalCollectedCentavos) },
@@ -409,7 +775,7 @@ export function ReportsPage() {
       { metric: "Void Lines", value: Number(eodData.voidLineCount) || 0, isCount: true },
       { metric: "Marketing Freebie Tickets", value: Number(eodData.marketingTicketCount) || 0, isCount: true },
     ];
-    
+
     data.forEach(row => {
       const addedRow = ws.addRow(row);
       if (row.metric) {
@@ -433,15 +799,15 @@ export function ReportsPage() {
 
   async function downloadBirXlsx() {
     if (!birData || !birData.transactions || !birData.summary) {
-      alert("No data available to export.");
+      emitToast("error", "No data available to export.");
       return;
     }
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet("BIR Report");
-    
+
     const s = birData.summary as any;
     const c = (val: any) => (Number(val) || 0) / 100;
-    
+
     ws.getColumn('A').width = 25;
     ws.getColumn('B').width = 20;
 
@@ -462,7 +828,7 @@ export function ReportsPage() {
       { label: "VAT-Exempt", value: 0 },
       { label: "Zero-Rated", value: 0 },
     ];
-    
+
     summaryRows.forEach(row => {
       const addedRow = ws.addRow([row.label, row.value]);
       if (row.isCount) {
@@ -482,7 +848,7 @@ export function ReportsPage() {
     const txHeaderRow = ws.addRow(["No.", "OR/Ticket", "Date", "Time", "Type", "Gross", "Discount", "Net Sales", "Vatable", "VAT 12%", "Total"]);
     txHeaderRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
     txHeaderRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF00B050" } };
-    
+
     const widths = [8, 15, 12, 10, 10, 12, 12, 12, 12, 12, 12];
     widths.forEach((w, i) => {
       ws.getColumn(i + 1).width = Math.max(ws.getColumn(i + 1).width || 0, w);
@@ -513,7 +879,7 @@ export function ReportsPage() {
         <h1 className="page-title" style={{ margin: 0, fontSize: "2rem", color: "var(--text)" }}>Reports & Analytics</h1>
         <div className="row" style={{ gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <div className="row" style={{ gap: 8, background: "var(--panel)", padding: 6, borderRadius: 16, border: "1px solid var(--border)", flexWrap: "wrap" }}>
-            {(["eod","analytics","forecast","feedback","audit"] as const).map(t => (
+            {(["eod", "analytics", "forecast", "feedback", "audit"] as const).map(t => (
               <button key={t} type="button" className={tab === t ? "primary-btn" : "ghost-btn"} onClick={() => setTab(t)}>
                 {t === "eod" ? "Sales Summary" : t === "analytics" ? "Analytics & KPI" : t === "forecast" ? "📈 AI Forecast" : t === "feedback" ? "Customer Feedback" : "Audit Logs"}
               </button>
@@ -576,11 +942,13 @@ export function ReportsPage() {
                     <div style={{ fontWeight: 700, fontSize: 14, color: "var(--text)", borderBottom: "2px solid var(--border)", paddingBottom: 10, marginBottom: 10 }}>📊 Income Statement</div>
                     {[
                       ["Gross Sales", Number(eodData?.grossSalesCentavos ?? 0), false, false],
-                      ["Less: Discounts", -Number(eodData?.discountsCentavos ?? 0), false, false],
+                      ["Less: Line Discounts", -Number(eodData?.discountOnlyCentavos ?? 0), false, false],
+                      ["Less: Order Discounts", -Number(eodData?.orderDiscountCentavos ?? 0), false, false],
                       ["Less: Marketing Expense", -Number(eodData?.marketingExpenseCentavos ?? 0), false, false],
                       ["Total Discounts", -Number(eodData?.totalDiscountsCentavos ?? 0), false, false],
                       ["Net Sales", Number(eodData?.netSalesCentavos ?? 0), true, false],
                       ["Less: Refunds / Returns", -Number(eodData?.refundsCentavos ?? 0), false, false],
+                      ["Add: Service Charge", Number(eodData?.serviceChargeCentavos ?? 0), false, false],
                       ["Adjusted Net Revenue", Number(eodData?.adjustedNetCentavos ?? 0), true, false],
                       ["Adjusted Net After Marketing", Number(eodData?.adjustedAfterMarketingCentavos ?? 0), true, true],
                     ].map(([label, val, sep, bold]) => (
@@ -620,8 +988,10 @@ export function ReportsPage() {
                     <div className="card stack" style={{ gap: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: 14, color: "var(--text)", borderBottom: "2px solid var(--border)", paddingBottom: 10, marginBottom: 10 }}>💰 Collections</div>
                       {[
+                        ["Tips Collected", Number(eodData?.tipCentavos ?? 0)],
                         ["Cash", Number(eodData?.cashCentavos ?? 0)],
-                        ["E-Wallet", Number(eodData?.ewalletCentavos ?? 0)],
+                        ["GCash", Number(eodData?.gcashCentavos ?? 0)],
+                        ["Bank Transfer", Number(eodData?.bankTransferCentavos ?? 0)],
                         ["Total Collected", Number(eodData?.totalCollectedCentavos ?? 0)],
                       ].map(([label, val], i, arr) => (
                         <div key={String(label)} className="row" style={{ justifyContent: "space-between", padding: "8px 0", borderBottom: i === arr.length - 2 ? "2px solid var(--border)" : "1px solid var(--border)" }}>
@@ -653,25 +1023,27 @@ export function ReportsPage() {
                 <div className="stack" style={{ gap: 16 }}>
                   {/* BIR Summary */}
                   <div className="row" style={{ gap: 18, flexWrap: "wrap" }}>
-                    {(() => { const s = birData?.summary as any; return s && ([
-                      ["Total Transactions", String(s.totalTransactions)],
-                      ["Gross Sales", formatPhp(Number(s.grossSalesCentavos))],
-                      ["Discounts", formatPhp(Number(s.discountOnlyCentavos ?? s.discountsCentavos ?? 0))],
-                      ["Marketing Expense", formatPhp(Number(s.marketingExpenseCentavos ?? 0))],
-                      ["Total Discounts", formatPhp(Number(s.totalDiscountsCentavos ?? s.discountsCentavos ?? 0))],
-                      ["Net Sales", formatPhp(Number(s.netSalesCentavos))],
-                      ["Less: Refunds / Returns", formatPhp(-Number(s.refundsCentavos ?? 0))],
-                      ["Adjusted Net Sales", formatPhp(Number(s.adjustedNetSalesCentavos ?? s.netSalesCentavos))],
-                      ["VATable Sales", formatPhp(Number(s.vatableSalesCentavos))],
-                      ["Output VAT 12%", formatPhp(Number(s.vatCollectedCentavos))],
-                      ["VAT-Exempt", "₱0.00"],
-                      ["Zero-Rated", "₱0.00"],
-                    ] as [string,string][]).map(([l,v]) => (
-                      <div key={l} className="card stack" style={{ flex: "1 1 130px", gap: 2, padding: "10px 14px" }}>
-                        <div className="muted" style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase" }}>{l}</div>
-                        <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text)" }}>{v}</div>
-                      </div>
-                    )); })()}
+                    {(() => {
+                      const s = birData?.summary as any; return s && ([
+                        ["Total Transactions", String(s.totalTransactions)],
+                        ["Gross Sales", formatPhp(Number(s.grossSalesCentavos))],
+                        ["Discounts", formatPhp(Number(s.discountOnlyCentavos ?? s.discountsCentavos ?? 0))],
+                        ["Marketing Expense", formatPhp(Number(s.marketingExpenseCentavos ?? 0))],
+                        ["Total Discounts", formatPhp(Number(s.totalDiscountsCentavos ?? s.discountsCentavos ?? 0))],
+                        ["Net Sales", formatPhp(Number(s.netSalesCentavos))],
+                        ["Less: Refunds / Returns", formatPhp(-Number(s.refundsCentavos ?? 0))],
+                        ["Adjusted Net Sales", formatPhp(Number(s.adjustedNetSalesCentavos ?? s.netSalesCentavos))],
+                        ["VATable Sales", formatPhp(Number(s.vatableSalesCentavos))],
+                        ["Output VAT 12%", formatPhp(Number(s.vatCollectedCentavos))],
+                        ["VAT-Exempt", "₱0.00"],
+                        ["Zero-Rated", "₱0.00"],
+                      ] as [string, string][]).map(([l, v]) => (
+                        <div key={l} className="card stack" style={{ flex: "1 1 130px", gap: 2, padding: "10px 14px" }}>
+                          <div className="muted" style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase" }}>{l}</div>
+                          <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text)" }}>{v}</div>
+                        </div>
+                      ));
+                    })()}
                   </div>
 
 
@@ -690,6 +1062,7 @@ export function ReportsPage() {
                               { label: "OR/Ticket", width: "110px", align: "left" },
                               { label: "Date/Time", width: "130px", align: "left" },
                               { label: "Type", width: "90px", align: "left" },
+                              { label: "Method", width: "110px", align: "left" },
                               { label: "Gross", width: "100px", align: "right" },
                               { label: "Discount", width: "100px", align: "right" },
                               { label: "Net Sales", width: "110px", align: "right" },
@@ -706,28 +1079,43 @@ export function ReportsPage() {
                             const all = (birData?.transactions ?? []) as any[];
                             const start = (birPage - 1) * birLimit;
                             const slice = all.slice(start, start + birLimit);
-                            
+
                             if (slice.length === 0) return <tr><td colSpan={10} style={{ padding: 40, textAlign: "center", color: "var(--muted)" }}>No transactions found.</td></tr>;
 
-                            return slice.map((r: any) => (
-                              <tr key={r.no} className="hover-row" style={{ borderBottom: "1px solid var(--border-subtle)" }}>
-                                <td style={{ padding: "10px 12px", color: "var(--muted)" }}>{r.no}</td>
-                                <td style={{ padding: "10px 12px", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 600 }}>{r.ticketId}</td>
-                                <td style={{ padding: "10px 12px" }}>
-                                  <div style={{ fontSize: 11, fontWeight: 500 }}>{r.date}</div>
-                                  <div className="muted" style={{ fontSize: 10 }}>{r.time}</div>
-                                </td>
-                                <td style={{ padding: "10px 12px" }}>
-                                  <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: r.type === "takeout" ? "var(--accent-muted)" : "var(--bg-elevated)", color: r.type === "takeout" ? "var(--accent-strong)" : "var(--text)", fontWeight: 700, textTransform: "uppercase" }}>{r.type}</span>
-                                </td>
-                                <td style={{ padding: "10px 12px", textAlign: "right" }}>{formatPhp(r.grossAmount)}</td>
-                                <td style={{ padding: "10px 12px", textAlign: "right", color: "#ef4444" }}>{r.discount ? `(${formatPhp(r.discount)})` : "—"}</td>
-                                <td style={{ padding: "10px 12px", textAlign: "right", fontWeight: 700 }}>{formatPhp(r.netAmount)}</td>
-                                <td style={{ padding: "10px 12px", textAlign: "right" }}>{formatPhp(r.vatableSales)}</td>
-                                <td style={{ padding: "10px 12px", textAlign: "right" }}>{r.vatAmount ? formatPhp(r.vatAmount) : "—"}</td>
-                                <td style={{ padding: "10px 12px", textAlign: "right", fontWeight: 800, color: "var(--accent-strong)", fontSize: 13 }}>{formatPhp(r.totalAmount)}</td>
-                              </tr>
-                            ));
+                            return slice.map((r: any) => {
+                              const isRefund = r.entryType === "refund" || r.type === "refund";
+                              const negStyle = isRefund ? { color: "#ef4444" } : undefined;
+                              const fmtNeg = (n: number) => {
+                                if (isRefund && n < 0) return `(${formatPhp(Math.abs(n))})`;
+                                return formatPhp(n);
+                              };
+                              return (
+                                <tr key={`${r.entryType ?? "sale"}-${r.id ?? r.no}`} className="hover-row" style={{ borderBottom: "1px solid var(--border-subtle)", ...(isRefund ? { background: "rgba(239,68,68,0.04)" } : {}) }}>
+                                  <td style={{ padding: "10px 12px", color: "var(--muted)" }}>{r.no}</td>
+                                  <td style={{ padding: "10px 12px", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 600 }}>{r.ticketId}</td>
+                                  <td style={{ padding: "10px 12px" }}>
+                                    <div style={{ fontSize: 11, fontWeight: 500 }}>{r.date}</div>
+                                    <div className="muted" style={{ fontSize: 10 }}>{r.time}</div>
+                                  </td>
+                                  <td style={{ padding: "10px 12px" }}>
+                                    <span style={{
+                                      fontSize: 10, padding: "2px 6px", borderRadius: 4, fontWeight: 700, textTransform: "uppercase",
+                                      background: isRefund ? "rgba(239,68,68,0.12)" : r.type === "takeout" ? "var(--accent-muted)" : "var(--bg-elevated)",
+                                      color: isRefund ? "#ef4444" : r.type === "takeout" ? "var(--accent-strong)" : "var(--text)",
+                                    }}>{isRefund ? "refund" : r.type}</span>
+                                  </td>
+                                  <td style={{ padding: "10px 12px" }}>
+                                    <span style={{ fontSize: 11, color: "var(--text)" }}>{isRefund ? "—" : (r.paymentMethod || "—")}</span>
+                                  </td>
+                                  <td style={{ padding: "10px 12px", textAlign: "right", ...negStyle }}>{isRefund ? "—" : formatPhp(r.grossAmount)}</td>
+                                  <td style={{ padding: "10px 12px", textAlign: "right", color: "#ef4444" }}>{r.discount ? `(${formatPhp(r.discount)})` : "—"}</td>
+                                  <td style={{ padding: "10px 12px", textAlign: "right", fontWeight: 700, ...negStyle }}>{fmtNeg(r.netAmount)}</td>
+                                  <td style={{ padding: "10px 12px", textAlign: "right", ...negStyle }}>{fmtNeg(r.vatableSales)}</td>
+                                  <td style={{ padding: "10px 12px", textAlign: "right", ...negStyle }}>{r.vatAmount ? fmtNeg(r.vatAmount) : "—"}</td>
+                                  <td style={{ padding: "10px 12px", textAlign: "right", fontWeight: 800, fontSize: 13, ...(isRefund ? { color: "#ef4444" } : { color: "var(--accent-strong)" }) }}>{fmtNeg(r.totalAmount)}</td>
+                                </tr>
+                              );
+                            });
                           })()}
                         </tbody>
                       </table>
@@ -743,7 +1131,7 @@ export function ReportsPage() {
                           <button type="button" className="ghost-btn tiny-btn" disabled={birPage === 1} onClick={() => setBirPage(p => Math.max(1, p - 1))}>Previous</button>
                           <div className="row" style={{ gap: 4, padding: "0 8px" }}>
                             {Array.from({ length: Math.ceil((birData?.transactions as any[]).length / birLimit) }).map((_, i) => (
-                              <button key={i} type="button" 
+                              <button key={i} type="button"
                                 onClick={() => setBirPage(i + 1)}
                                 style={{ width: 28, height: 28, borderRadius: 6, border: "none", background: birPage === i + 1 ? "var(--accent)" : "transparent", color: birPage === i + 1 ? "#fff" : "var(--text)", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
                                 {i + 1}
@@ -772,13 +1160,13 @@ export function ReportsPage() {
             {/* KPI Cards — 4 per row */}
             {kpi && (
               <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
-                <KpiCard label="Total Orders" value={kpi.totalTickets.toLocaleString()} sub={demo ? DEMOGRAPHICS.find(d=>d.value===demo)?.label : "All profiles"} />
+                <KpiCard label="Total Orders" value={kpi.totalTickets.toLocaleString()} sub={demo ? DEMOGRAPHICS.find(d => d.value === demo)?.label : "All profiles"} />
                 <KpiCard label="Total Cups Sold" value={kpi.totalCupsSold.toLocaleString()} sub="Items sold" />
                 <KpiCard label="Total Revenue" value={formatPhp(kpi.totalRevenueCentavos)} sub="Completed payments" />
                 <KpiCard label="Avg Order Value" value={formatPhp(kpi.avgOrderValueCentavos)} sub="Per ticket" />
                 <KpiCard label="Avg Rating" value={kpi.avgRating != null ? `★ ${Number(kpi.avgRating).toFixed(1)}` : "—"} sub={`${kpi.feedbackCount} reviews`} />
-                <KpiCard label="Dine-in" value={kpi.dineInCount.toLocaleString()} sub={`${kpi.totalTickets > 0 ? Math.round(kpi.dineInCount/kpi.totalTickets*100) : 0}% of orders`} />
-                <KpiCard label="Takeout" value={kpi.takeoutCount.toLocaleString()} sub={`${kpi.totalTickets > 0 ? Math.round(kpi.takeoutCount/kpi.totalTickets*100) : 0}% of orders`} />
+                <KpiCard label="Dine-in" value={kpi.dineInCount.toLocaleString()} sub={`${kpi.totalTickets > 0 ? Math.round(kpi.dineInCount / kpi.totalTickets * 100) : 0}% of orders`} />
+                <KpiCard label="Takeout" value={kpi.takeoutCount.toLocaleString()} sub={`${kpi.totalTickets > 0 ? Math.round(kpi.takeoutCount / kpi.totalTickets * 100) : 0}% of orders`} />
                 <KpiCard label="Top Product" value={kpi.topProduct?.name ?? "—"} sub={kpi.topProduct ? `${kpi.topProduct.sold} sold` : ""} />
                 <KpiCard label="Peak Hour" value={kpi.peakHour ? `${kpi.peakHour.hour}:00` : "—"} sub={kpi.peakHour ? `${kpi.peakHour.count} orders` : ""} />
               </div>
@@ -822,7 +1210,7 @@ export function ReportsPage() {
               {/* Daily Trend */}
               <div className="card stack" style={{ flex: "1 1 340px", gap: 8 }}>
                 <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>
-                  Daily Orders Trend {demo ? `· ${DEMOGRAPHICS.find(d=>d.value===demo)?.label}` : "· All Profiles"}
+                  Daily Orders Trend {demo ? `· ${DEMOGRAPHICS.find(d => d.value === demo)?.label}` : "· All Profiles"}
                 </h3>
                 <div className="muted" style={{ fontSize: 12 }}>Ticket count & revenue over time</div>
                 {daily.length === 0
@@ -833,7 +1221,7 @@ export function ReportsPage() {
                         <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} />
                         <XAxis dataKey="day" stroke={ct.axis} tick={{ fontSize: 10 }} />
                         <YAxis yAxisId="left" stroke={ct.axis} tick={{ fontSize: 10 }} />
-                        <YAxis yAxisId="right" orientation="right" stroke={ct.axis} tick={{ fontSize: 10 }} tickFormatter={v => `₱${(v/100).toFixed(0)}`} />
+                        <YAxis yAxisId="right" orientation="right" stroke={ct.axis} tick={{ fontSize: 10 }} tickFormatter={v => `₱${(v / 100).toFixed(0)}`} />
                         <Tooltip contentStyle={{ backgroundColor: ct.bg, border: `1px solid ${ct.grid}`, borderRadius: 10, color: "var(--text)", fontSize: 12 }} formatter={(v: any, name: any) => name === "revenue" ? formatPhp(Number(v)) : v} />
                         <Legend iconSize={10} wrapperStyle={{ fontSize: 11 }} />
                         <Line yAxisId="left" type="monotone" dataKey="ticket_count" stroke={demo ? DEMO_COLORS[demo] ?? "var(--accent)" : "var(--accent)"} name="Orders" strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
@@ -884,7 +1272,7 @@ export function ReportsPage() {
                       </div>
                       <ResponsiveContainer width="100%" height={180}>
                         <PieChart>
-                          <Pie data={orderTypes} dataKey="count" nameKey="ticket_type" cx="50%" cy="50%" outerRadius={65} label={(entry: any) => `${String(entry.ticket_type ?? entry.name ?? "").replace("_","-")} ${(Number(entry.percent)*100).toFixed(0)}%`}>
+                          <Pie data={orderTypes} dataKey="count" nameKey="ticket_type" cx="50%" cy="50%" outerRadius={65} label={(entry: any) => `${String(entry.ticket_type ?? entry.name ?? "").replace("_", "-")} ${(Number(entry.percent) * 100).toFixed(0)}%`}>
                             {orderTypes.map((_, i) => <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />)}
                           </Pie>
                           <Tooltip formatter={(v: any) => [`${v} orders`]} contentStyle={{ backgroundColor: ct.bg, border: `1px solid ${ct.grid}`, borderRadius: 10, color: "var(--text)", fontSize: 12 }} />
@@ -916,7 +1304,7 @@ export function ReportsPage() {
             {feedbacks.map((f, i) => (
               <div key={i} className="stack" style={{ padding: "16px 20px", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 16 }}>
                 <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
-                  <strong style={{ fontSize: 15, color: "var(--text)" }}>Ticket: {f.id.slice(0,8)}</strong>
+                  <strong style={{ fontSize: 15, color: "var(--text)" }}>Ticket: {f.id.slice(0, 8)}</strong>
                   <span className="muted" style={{ fontSize: 12 }}>{new Date(f.created_at).toLocaleString()}</span>
                 </div>
                 <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
@@ -944,9 +1332,9 @@ export function ReportsPage() {
                 <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: "var(--text)" }}>📈 AI-Powered Demand Forecast</h2>
                 <p className="muted" style={{ margin: 0, fontSize: 12 }}>Next 7 days predicted sales using historical patterns</p>
               </div>
-              <button 
-                type="button" 
-                className={forecastLoading ? "ghost-btn" : "primary-btn"} 
+              <button
+                type="button"
+                className={forecastLoading ? "ghost-btn" : "primary-btn"}
                 onClick={refreshForecast}
                 disabled={forecastLoading}
                 style={{ minWidth: 140 }}>
@@ -996,7 +1384,7 @@ export function ReportsPage() {
                         <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>7-Day Forecast</h3>
                         <div className="muted" style={{ fontSize: 12 }}>Predicted daily order volume</div>
                         <ResponsiveContainer width="100%" height={280}>
-                          <BarChart 
+                          <BarChart
                             data={forecast.forecasts.map((f: any) => ({
                               date: new Date(f.date).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
                               units: f.totalForecastedUnits,
@@ -1006,7 +1394,7 @@ export function ReportsPage() {
                             <CartesianGrid strokeDasharray="3 3" stroke={ct.grid} />
                             <XAxis dataKey="date" stroke={ct.axis} tick={{ fontSize: 10 }} />
                             <YAxis stroke={ct.axis} tick={{ fontSize: 10 }} />
-                            <Tooltip 
+                            <Tooltip
                               contentStyle={{ backgroundColor: ct.bg, border: `1px solid ${ct.grid}`, borderRadius: 10, color: "var(--text)", fontSize: 12 }}
                               formatter={(v: any) => [`${v} units`, "Forecasted"]}
                               labelFormatter={(label) => `Forecast: ${String(label)}`}
@@ -1022,7 +1410,7 @@ export function ReportsPage() {
                       <div className="card stack" style={{ gap: 12 }}>
                         <h3 style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "var(--text)" }}>Product Forecast Breakdown</h3>
                         <div className="muted" style={{ fontSize: 12 }}>Predicted units per product across 7 days</div>
-                        
+
                         {/* Product rows */}
                         <div className="stack" style={{ gap: 8 }}>
                           {forecast.forecasts[0].byProduct.map((product: any, i: number) => {
@@ -1030,7 +1418,7 @@ export function ReportsPage() {
                               const p = day.byProduct.find((bp: any) => bp.productName === product.productName);
                               return sum + (p?.forecastedUnits || 0);
                             }, 0);
-                            
+
                             return (
                               <div key={i} className="row" style={{ justifyContent: "space-between", alignItems: "center", padding: "10px 12px", background: "var(--bg)", borderRadius: 8, border: "1px solid var(--border)" }}>
                                 <div className="stack" style={{ gap: 2, flex: 1 }}>
@@ -1172,6 +1560,101 @@ export function ReportsPage() {
                 Clear
               </button>
             )}
+            <button
+              type="button"
+              className="ghost-btn"
+              style={{ fontWeight: 600, padding: "8px 12px", border: "1px solid var(--border)" }}
+              onClick={() => {
+                const w = window.open("", "_blank");
+                if (!w) return;
+                
+                let html = `<!DOCTYPE html><html><head><title>Audit Logs</title>
+                <style>
+                  body { font-family: Arial, sans-serif; padding: 32px; color: #111; font-size: 12px; }
+                  h1 { margin: 0 0 8px; font-size: 18px; }
+                  .filters { font-size: 12px; color: #555; margin-bottom: 16px; }
+                  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+                  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #ddd; vertical-align: top; }
+                  th { background: #f5f5f5; font-weight: 700; }
+                  .details { font-size: 11px; color: #333; margin-top: 4px; line-height: 1.4; }
+                </style></head><body>
+                <h1>System Audit Logs</h1>
+                <div class="filters">Total records: ${filteredAudit.length} | Filters: ${[auditActionFilter !== 'all' ? `Action: ${auditActionFilter}` : '', auditUserFilter !== 'all' ? `User: ${auditUserFilter}` : '', auditOrderFilter !== 'all' ? `Type: ${auditOrderFilter}` : '', dateType !== 'all' ? `Date: ${activeDateLabel}` : ''].filter(Boolean).join(', ') || 'None'}</div>
+                <table>
+                  <thead>
+                    <tr>
+                      <th style="width: 140px;">Date/Time</th>
+                      <th style="width: 120px;">User</th>
+                      <th style="width: 150px;">Action</th>
+                      <th>Details</th>
+                    </tr>
+                  </thead>
+                  <tbody>`;
+
+                for (const ev of filteredAudit) {
+                  const isProductUpdate = ev.action === "product.update";
+                  const isProductCreate = ev.action === "product.create";
+                  const isLineVoid = ev.action === "line.void";
+                  const isTicketRefund = ev.action === "ticket.refund";
+                  const isTicketParked = ev.action === "ticket.parked";
+                  const isTicketResumed = ev.action === "ticket.resumed";
+                  const isStaffCreate = ev.action === "staff.create";
+                  const isCategoryCreate = ev.action === "category.create";
+                  
+                  let detailsText = "";
+                  
+                  if (ev.ticket_no) detailsText += `<strong>Ticket #${String(ev.ticket_no).padStart(4, "0")}</strong><br>`;
+                  
+                  if (isLineVoid) {
+                    const lv = lineVoidDetails(ev);
+                    if (lv) detailsText += `${lv.qty}x ${lv.productName} (${formatPhp(lv.amountCentavos)})` + (lv.reason ? `<br>Reason: ${lv.reason}` : "");
+                  } else if (isTicketRefund) {
+                    const tr = ticketRefundDetails(ev);
+                    if (tr) detailsText += `Refund: ${formatPhp(tr.amountCentavos)}` + (tr.reason ? `<br>Reason: ${tr.reason}` : "") + (tr.note ? `<br>Note: ${tr.note}` : "");
+                  } else if (isTicketParked) {
+                    const tp = ticketParkedDetails(ev);
+                    if (tp && tp.parkedLabel) detailsText += `Parked Label: ${tp.parkedLabel}`;
+                  } else if (isTicketResumed) {
+                    const tr = ticketResumedDetails(ev);
+                    if (tr && tr.parkedLabel) detailsText += `Resumed Label: ${tr.parkedLabel}`;
+                  } else if (isProductUpdate || isProductCreate) {
+                    const pd = isProductCreate ? productCreateDetails(ev) : productUpdateDetails(ev);
+                    if (pd) {
+                      detailsText += `<strong>Product: ${pd.productName}</strong><br>`;
+                      const fields = isProductCreate ? (pd as any).fields : (pd as any).changes;
+                      if (fields && fields.length > 0) {
+                        detailsText += fields.map((f: any) => `<b>${f.label}</b>: ${f.key === 'priceCentavos' ? formatPhp(Number(f.value||0)) : typeof f.value === 'object' ? JSON.stringify(f.value) : String(f.value)}`).join("<br>");
+                      }
+                    }
+                  } else if (isStaffCreate) {
+                    const sc = staffCreateDetails(ev);
+                    if (sc) detailsText += `${sc.displayName} (${sc.staffCode}) - ${sc.role}`;
+                  } else if (isCategoryCreate) {
+                    const cc = categoryCreateDetails(ev);
+                    if (cc) detailsText += `${cc.name} (${cc.productKindLabel})`;
+                  } else if (ev.entity_type === "ticket" && (ev as any).audit_ticket_products) {
+                    detailsText += `${(ev as any).audit_ticket_products}<br>Cost: ${formatPhp(Number((ev as any).audit_ticket_due_centavos || 0))}`;
+                  } else if (ev.entity_type) {
+                    detailsText += `Entity: ${ev.entity_type} / ${ev.entity_id || 'N/A'}`;
+                  }
+
+                  html += `<tr>
+                    <td>${new Date(String(ev.created_at)).toLocaleString()}</td>
+                    <td>${ev.user_name ?? "System"}</td>
+                    <td><strong>${ev.action}</strong></td>
+                    <td><div class="details">${detailsText}</div></td>
+                  </tr>`;
+                }
+
+                html += `</tbody></table></body></html>`;
+                w.document.write(html);
+                w.document.close();
+                w.focus();
+                setTimeout(() => { w.print(); }, 500);
+              }}
+            >
+              🖨 Export PDF
+            </button>
           </div>
           <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
             Showing {filteredAudit.length} of {audit.length} logs
@@ -1181,6 +1664,31 @@ export function ReportsPage() {
           )}
           {filteredAudit.map(ev => {
             const isPurchase = ev.action === "ticket.create" || ev.action === "ticket.close_freebie";
+            const isTicketVoid = ev.action === "ticket.void";
+            const isLineVoid = ev.action === "line.void";
+            const isProductUpdate = ev.action === "product.update";
+            const isProductCreate = ev.action === "product.create";
+            const isTicketRefund = ev.action === "ticket.refund";
+            const isTicketParked = ev.action === "ticket.parked";
+            const isTicketResumed = ev.action === "ticket.resumed";
+            const isStaffCreate = ev.action === "staff.create";
+            const isCategoryCreate = ev.action === "category.create";
+            const lineVoid = isLineVoid ? lineVoidDetails(ev) : null;
+            const productUpdate = isProductUpdate ? productUpdateDetails(ev) : null;
+            const productCreate = isProductCreate ? productCreateDetails(ev) : null;
+            const ticketRefund = isTicketRefund ? ticketRefundDetails(ev) : null;
+            const ticketParked = isTicketParked ? ticketParkedDetails(ev) : null;
+            const ticketResumed = isTicketResumed ? ticketResumedDetails(ev) : null;
+            const staffCreate = isStaffCreate ? staffCreateDetails(ev) : null;
+            const categoryCreate = isCategoryCreate ? categoryCreateDetails(ev) : null;
+            const canViewTicketReceipt = Boolean(ev.entity_id && (isPurchase || isTicketVoid || isTicketRefund || isTicketParked || isTicketResumed));
+            const canViewLineVoid = Boolean(isLineVoid && (lineVoid?.productName || ev.entity_id));
+            const canViewProductUpdate = Boolean(isProductUpdate && (productUpdate?.productName || ev.entity_id));
+            const canViewProductCreate = Boolean(isProductCreate && (productCreate?.productName || ev.entity_id));
+            const canViewRefund = Boolean(isTicketRefund && ticketRefund && (ticketRefund.amountCentavos > 0 || ticketRefund.reason || ev.entity_id));
+            const canViewParked = Boolean((isTicketParked || isTicketResumed) && ev.entity_id);
+            const canViewStaffCreate = Boolean(isStaffCreate && (staffCreate?.staffCode || ev.entity_id));
+            const canViewCategoryCreate = Boolean(isCategoryCreate && (categoryCreate?.name || ev.entity_id));
             const isTicketLifecycle = [
               "ticket.opened",
               "ticket.parked",
@@ -1196,21 +1704,142 @@ export function ReportsPage() {
                 <div style={{ flex: 1, color: "var(--text)" }}>
                   <strong style={{ color: "var(--ok)", fontSize: 14 }}>{String(ev.action)}</strong>
                   {isPurchase ? <span style={{ marginLeft: 8, padding: "2px 6px", background: "var(--ok)", color: "#fff", borderRadius: 4, fontSize: 10, fontWeight: 700 }}>ORDER PROCESSED</span> : null}
-                  {formattedTicketNo && (isPurchase || isTicketLifecycle) ? (
+                  {formattedTicketNo && (isPurchase || isTicketLifecycle || isLineVoid) ? (
                     <span style={{ marginLeft: 8, padding: "2px 7px", background: "var(--accent-muted)", color: "var(--accent-strong)", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid var(--accent)" }}>
                       Ticket {formattedTicketNo}
                     </span>
                   ) : null}
-                  {ev.entity_type && !isTicketLifecycle && !isPurchase ? <span className="muted" style={{ marginLeft: 6 }}>· {String(ev.entity_type)}</span> : ""}
+                  {isTicketRefund && ticketRefund && ticketRefund.amountCentavos > 0 ? (
+                    <span style={{ marginLeft: 8, padding: "2px 7px", background: "color-mix(in srgb, #f59e0b 12%, #fff)", color: "#b45309", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid color-mix(in srgb, #f59e0b 45%, var(--border))" }}>
+                      Refund {formatPhp(ticketRefund.amountCentavos)}{ticketRefund.reason ? ` · ${ticketRefund.reason}` : ""}
+                    </span>
+                  ) : null}
+                  {isTicketParked && ticketParked?.parkedLabel ? (
+                    <span style={{ marginLeft: 8, padding: "2px 7px", background: "color-mix(in srgb, #ef4444 12%, #fff)", color: "#b91c1c", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid color-mix(in srgb, #ef4444 45%, var(--border))" }}>
+                      Parked: {ticketParked.parkedLabel}
+                    </span>
+                  ) : null}
+                  {isTicketResumed && ticketResumed?.parkedLabel ? (
+                    <span style={{ marginLeft: 8, padding: "2px 7px", background: "color-mix(in srgb, var(--accent) 12%, #fff)", color: "var(--accent-strong)", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))" }}>
+                      Resumed from: {ticketResumed.parkedLabel}
+                    </span>
+                  ) : null}
+                  {isLineVoid && lineVoid && lineVoid.qty > 0 ? (
+                    <span style={{ marginLeft: 8, padding: "2px 7px", background: "color-mix(in srgb, var(--danger) 12%, #fff)", color: "#8f3030", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid color-mix(in srgb, var(--danger) 45%, var(--border))" }}>
+                      {lineVoid.qty}× {lineVoid.productName} · {formatPhp(lineVoid.amountCentavos)}
+                    </span>
+                  ) : null}
+                  {isProductUpdate && productUpdate?.productName ? (
+                    <span style={{ marginLeft: 8, padding: "2px 7px", background: "color-mix(in srgb, var(--accent) 12%, #fff)", color: "var(--accent-strong)", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))" }}>
+                      {productUpdate.productName}
+                    </span>
+                  ) : null}
+                  {isProductCreate && productCreate?.productName ? (
+                    <span style={{ marginLeft: 8, padding: "2px 7px", background: "color-mix(in srgb, var(--ok) 12%, #fff)", color: "#15803d", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid color-mix(in srgb, var(--ok) 45%, var(--border))" }}>
+                      {productCreate.productName}
+                    </span>
+                  ) : null}
+                  {isStaffCreate && staffCreate?.displayName ? (
+                    <span style={{ marginLeft: 8, padding: "2px 7px", background: "color-mix(in srgb, #6366f1 12%, #fff)", color: "#4338ca", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid color-mix(in srgb, #6366f1 45%, var(--border))" }}>
+                      {staffCreate.displayName} · {staffCreate.staffCode} · {staffCreate.role}
+                    </span>
+                  ) : isStaffCreate && staffCreate?.staffCode ? (
+                    <span style={{ marginLeft: 8, padding: "2px 7px", background: "color-mix(in srgb, #6366f1 12%, #fff)", color: "#4338ca", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid color-mix(in srgb, #6366f1 45%, var(--border))" }}>
+                      {staffCreate.staffCode} · {staffCreate.role}
+                    </span>
+                  ) : null}
+                  {isCategoryCreate && categoryCreate?.name ? (
+                    <span style={{ marginLeft: 8, padding: "2px 7px", background: "color-mix(in srgb, #8b5cf6 12%, #fff)", color: "#6d28d9", borderRadius: 999, fontSize: 11, fontWeight: 700, border: "1px solid color-mix(in srgb, #8b5cf6 45%, var(--border))" }}>
+                      {categoryCreate.name} · {categoryCreate.productKindLabel}
+                    </span>
+                  ) : null}
+                  {ev.entity_type && !isTicketLifecycle && !isPurchase && !isLineVoid && !isProductCreate && !isStaffCreate && !isCategoryCreate ? <span className="muted" style={{ marginLeft: 6 }}>· {String(ev.entity_type)}</span> : ""}
                 </div>
                 <div className="row" style={{ gap: 8 }}>
-                  {isPurchase && ev.entity_id && (
+                  {canViewTicketReceipt && (
                     <button
                       type="button"
                       className="ghost-btn tiny-btn"
                       style={{ borderColor: "var(--border)", color: "var(--text)", padding: "4px 8px" }}
                       onClick={() => void openTicketDetail(String(ev.entity_id))}
                       title="View Ticket"
+                    >
+                      <span className="btn-icon" style={{ marginRight: 0 }}>📄</span> <span className="hide-mobile">View</span>
+                    </button>
+                  )}
+                  {canViewRefund && (
+                    <button
+                      type="button"
+                      className="ghost-btn tiny-btn"
+                      style={{ borderColor: "#f59e0b", color: "#b45309", padding: "4px 8px" }}
+                      onClick={() => setAuditRefundDetail(ev)}
+                      title="View refund details"
+                    >
+                      <span className="btn-icon" style={{ marginRight: 0 }}>↩</span> <span className="hide-mobile">Details</span>
+                    </button>
+                  )}
+                  {canViewParked && (
+                    <button
+                      type="button"
+                      className="ghost-btn tiny-btn"
+                      style={{ borderColor: isTicketParked ? "#ef4444" : "var(--accent)", color: isTicketParked ? "#ef4444" : "var(--accent-strong)", padding: "4px 8px" }}
+                      onClick={() => setAuditParkedDetail(ev)}
+                      title={isTicketParked ? "View parked ticket" : "View resumed ticket"}
+                    >
+                      <span className="btn-icon" style={{ marginRight: 0 }}>📋</span> <span className="hide-mobile">Details</span>
+                    </button>
+                  )}
+                  {canViewLineVoid && (
+                    <button
+                      type="button"
+                      className="ghost-btn tiny-btn"
+                      style={{ borderColor: "var(--border)", color: "var(--text)", padding: "4px 8px" }}
+                      onClick={() => setAuditLineVoidDetail(ev)}
+                      title="View voided item"
+                    >
+                      <span className="btn-icon" style={{ marginRight: 0 }}>📄</span> <span className="hide-mobile">View</span>
+                    </button>
+                  )}
+                  {canViewProductUpdate && (
+                    <button
+                      type="button"
+                      className="ghost-btn tiny-btn"
+                      style={{ borderColor: "var(--border)", color: "var(--text)", padding: "4px 8px" }}
+                      onClick={() => setAuditProductDetail(ev)}
+                      title="View updated product"
+                    >
+                      <span className="btn-icon" style={{ marginRight: 0 }}>📄</span> <span className="hide-mobile">View</span>
+                    </button>
+                  )}
+                  {canViewProductCreate && (
+                    <button
+                      type="button"
+                      className="ghost-btn tiny-btn"
+                      style={{ borderColor: "var(--ok)", color: "#15803d", padding: "4px 8px" }}
+                      onClick={() => setAuditProductDetail(ev)}
+                      title="View created product"
+                    >
+                      <span className="btn-icon" style={{ marginRight: 0 }}>📄</span> <span className="hide-mobile">View</span>
+                    </button>
+                  )}
+                  {canViewStaffCreate && (
+                    <button
+                      type="button"
+                      className="ghost-btn tiny-btn"
+                      style={{ borderColor: "#6366f1", color: "#4338ca", padding: "4px 8px" }}
+                      onClick={() => setAuditStaffDetail(ev)}
+                      title="View created staff"
+                    >
+                      <span className="btn-icon" style={{ marginRight: 0 }}>📄</span> <span className="hide-mobile">View</span>
+                    </button>
+                  )}
+                  {canViewCategoryCreate && (
+                    <button
+                      type="button"
+                      className="ghost-btn tiny-btn"
+                      style={{ borderColor: "#8b5cf6", color: "#6d28d9", padding: "4px 8px" }}
+                      onClick={() => setAuditCategoryDetail(ev)}
+                      title="View created category"
                     >
                       <span className="btn-icon" style={{ marginRight: 0 }}>📄</span> <span className="hide-mobile">View</span>
                     </button>
@@ -1436,6 +2065,414 @@ export function ReportsPage() {
           </div>
         </div>
       )}
+      {auditLineVoidDetail ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack" style={{ maxWidth: 520 }}>
+            {(() => {
+              const detail = lineVoidDetails(auditLineVoidDetail);
+              const ticketNo = auditLineVoidDetail.ticket_no
+                ? `#${String(auditLineVoidDetail.ticket_no).padStart(4, "0")}`
+                : null;
+              return (
+                <>
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                    <h2 style={{ margin: 0 }}>Voided Line Item</h2>
+                    <button type="button" className="ghost-btn tiny-btn" onClick={() => setAuditLineVoidDetail(null)}>✕ Close</button>
+                  </div>
+                  <div className="muted" style={{ fontSize: 13 }}>
+                    {new Date(String(auditLineVoidDetail.created_at)).toLocaleString()}
+                    {ticketNo ? ` · Ticket ${ticketNo}` : ""}
+                  </div>
+                  <div
+                    style={{
+                      border: "1px solid color-mix(in srgb, var(--danger) 35%, var(--border))",
+                      background: "color-mix(in srgb, var(--danger) 8%, #fff)",
+                      borderRadius: 14,
+                      padding: "16px 18px",
+                    }}
+                  >
+                    <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 8 }}>
+                      {detail.qty > 0 ? `${detail.qty}× ` : ""}{detail.productName}
+                    </div>
+                    <div className="stack" style={{ gap: 6, fontSize: 14 }}>
+                      <div className="row" style={{ justifyContent: "space-between" }}>
+                        <span className="muted">Unit price</span>
+                        <span>{formatPhp(detail.unit)}</span>
+                      </div>
+                      {detail.discount > 0 ? (
+                        <div className="row" style={{ justifyContent: "space-between" }}>
+                          <span className="muted">Discount</span>
+                          <span>-{formatPhp(detail.discount)}</span>
+                        </div>
+                      ) : null}
+                      <div className="row" style={{ justifyContent: "space-between", fontWeight: 700 }}>
+                        <span>Amount voided</span>
+                        <span style={{ color: "#8f3030" }}>{formatPhp(detail.amountCentavos)}</span>
+                      </div>
+                      {detail.reason ? (
+                        <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed var(--border)" }}>
+                          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>Void reason</div>
+                          <div>{detail.reason}</div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="row" style={{ gap: 8, marginTop: 4 }}>
+                    {detail.ticketId ? (
+                      <button
+                        type="button"
+                        className="primary-btn"
+                        onClick={() => {
+                          setAuditLineVoidDetail(null);
+                          void openTicketDetail(detail.ticketId);
+                        }}
+                      >
+                        View full ticket
+                      </button>
+                    ) : null}
+                    <button type="button" className="ghost-btn" onClick={() => setAuditLineVoidDetail(null)}>
+                      Close
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      ) : null}
+      {auditProductDetail ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack" style={{ maxWidth: 560 }}>
+            {(() => {
+              const isCreate = auditProductDetail.action === "product.create";
+              const detail = isCreate ? productCreateDetails(auditProductDetail) : productUpdateDetails(auditProductDetail);
+              const rows = isCreate
+                ? (detail as ReturnType<typeof productCreateDetails>).fields
+                : (detail as ReturnType<typeof productUpdateDetails>).changes;
+              return (
+                <>
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                    <h2 style={{ margin: 0 }}>{isCreate ? "Created Product" : "Updated Product"}</h2>
+                    <button type="button" className="ghost-btn tiny-btn" onClick={() => setAuditProductDetail(null)}>✕ Close</button>
+                  </div>
+                  <div className="muted" style={{ fontSize: 13 }}>
+                    {new Date(String(auditProductDetail.created_at)).toLocaleString()}
+                  </div>
+                  <div
+                    style={{
+                      border: `1px solid color-mix(in srgb, ${isCreate ? "var(--ok)" : "var(--accent)"} 35%, var(--border))`,
+                      background: `color-mix(in srgb, ${isCreate ? "var(--ok)" : "var(--accent)"} 8%, #fff)`,
+                      borderRadius: 14,
+                      padding: "16px 18px",
+                    }}
+                  >
+                    <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 10 }}>
+                      {detail.productName}
+                    </div>
+                    <div className="stack" style={{ gap: 8, fontSize: 14 }}>
+                      {rows.length ? rows.map((change) => (
+                        <div key={change.key} className="row" style={{ justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
+                          <span className="muted">{change.label}</span>
+                          <span style={{ textAlign: "right", maxWidth: 280, wordBreak: "break-word" }}>
+                            {change.key === "priceCentavos"
+                              ? formatPhp(Number(change.value ?? 0))
+                              : typeof change.value === "boolean"
+                                ? (change.value ? "Yes" : "No")
+                                : typeof change.value === "object"
+                                  ? JSON.stringify(change.value)
+                                  : String(change.value ?? "—")}
+                          </span>
+                        </div>
+                      )) : (
+                        <div className="muted">No field details recorded.</div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="row" style={{ marginTop: 4 }}>
+                    <button type="button" className="ghost-btn" onClick={() => setAuditProductDetail(null)}>
+                      Close
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      ) : null}
+      {auditRefundDetail ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack" style={{ maxWidth: 520 }}>
+            {(() => {
+              const detail = ticketRefundDetails(auditRefundDetail);
+              const ticketNo = detail.ticketNo
+                ? `#${String(detail.ticketNo).padStart(4, "0")}`
+                : auditRefundDetail.ticket_no
+                  ? `#${String(auditRefundDetail.ticket_no).padStart(4, "0")}`
+                  : null;
+              return (
+                <>
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                    <h2 style={{ margin: 0 }}>Ticket Refund</h2>
+                    <button type="button" className="ghost-btn tiny-btn" onClick={() => setAuditRefundDetail(null)}>✕ Close</button>
+                  </div>
+                  <div className="muted" style={{ fontSize: 13 }}>
+                    {new Date(String(auditRefundDetail.created_at)).toLocaleString()}
+                    {ticketNo ? ` · Ticket ${ticketNo}` : ""}
+                  </div>
+                  <div
+                    style={{
+                      border: "1px solid color-mix(in srgb, #f59e0b 35%, var(--border))",
+                      background: "color-mix(in srgb, #f59e0b 8%, #fff)",
+                      borderRadius: 14,
+                      padding: "16px 18px",
+                    }}
+                  >
+                    <div className="stack" style={{ gap: 8, fontSize: 14 }}>
+                      <div className="row" style={{ justifyContent: "space-between", fontWeight: 700 }}>
+                        <span>Refund amount</span>
+                        <span style={{ color: "#b45309", fontSize: 18 }}>{formatPhp(detail.amountCentavos)}</span>
+                      </div>
+                      {detail.reason ? (
+                        <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed var(--border)" }}>
+                          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>Reason</div>
+                          <div>{detail.reason}</div>
+                        </div>
+                      ) : null}
+                      {detail.note ? (
+                        <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed var(--border)" }}>
+                          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>Note</div>
+                          <div>{detail.note}</div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="row" style={{ gap: 8, marginTop: 4 }}>
+                    {detail.ticketId ? (
+                      <button
+                        type="button"
+                        className="primary-btn"
+                        onClick={() => {
+                          setAuditRefundDetail(null);
+                          void openTicketDetail(detail.ticketId);
+                        }}
+                      >
+                        View full ticket
+                      </button>
+                    ) : null}
+                    <button type="button" className="ghost-btn" onClick={() => setAuditRefundDetail(null)}>
+                      Close
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      ) : null}
+      {auditParkedDetail ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack" style={{ maxWidth: 520 }}>
+            {(() => {
+              const isParked = auditParkedDetail.action === "ticket.parked";
+              const detail = isParked ? ticketParkedDetails(auditParkedDetail) : ticketResumedDetails(auditParkedDetail);
+              const ticketNo = auditParkedDetail.ticket_no
+                ? `#${String(auditParkedDetail.ticket_no).padStart(4, "0")}`
+                : null;
+              return (
+                <>
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                    <h2 style={{ margin: 0 }}>{isParked ? "Parked Ticket" : "Resumed Ticket"}</h2>
+                    <button type="button" className="ghost-btn tiny-btn" onClick={() => setAuditParkedDetail(null)}>✕ Close</button>
+                  </div>
+                  <div className="muted" style={{ fontSize: 13 }}>
+                    {new Date(String(auditParkedDetail.created_at)).toLocaleString()}
+                    {ticketNo ? ` · Ticket ${ticketNo}` : ""}
+                  </div>
+                  <div
+                    style={{
+                      border: `1px solid color-mix(in srgb, ${isParked ? "#ef4444" : "var(--accent)"} 35%, var(--border))`,
+                      background: `color-mix(in srgb, ${isParked ? "#ef4444" : "var(--accent)"} 8%, #fff)`,
+                      borderRadius: 14,
+                      padding: "16px 18px",
+                    }}
+                  >
+                    <div className="stack" style={{ gap: 8, fontSize: 14 }}>
+                      {detail.parkedLabel ? (
+                        <div>
+                          <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
+                            {isParked ? "Parked label" : "Previously parked as"}
+                          </div>
+                          <div style={{ fontWeight: 700, fontSize: 16 }}>{detail.parkedLabel}</div>
+                        </div>
+                      ) : (
+                        <div className="muted">No parked label recorded.</div>
+                      )}
+                      {auditParkedDetail.ticket_type ? (
+                        <div className="row" style={{ justifyContent: "space-between", marginTop: 8, paddingTop: 8, borderTop: "1px dashed var(--border)" }}>
+                          <span className="muted">Order type</span>
+                          <span style={{ textTransform: "capitalize" }}>{String(auditParkedDetail.ticket_type).replace("_", " ")}</span>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="row" style={{ gap: 8, marginTop: 4 }}>
+                    {detail.ticketId ? (
+                      <button
+                        type="button"
+                        className="primary-btn"
+                        onClick={() => {
+                          setAuditParkedDetail(null);
+                          void openTicketDetail(detail.ticketId);
+                        }}
+                      >
+                        View full ticket
+                      </button>
+                    ) : null}
+                    <button type="button" className="ghost-btn" onClick={() => setAuditParkedDetail(null)}>
+                      Close
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      ) : null}
+      {auditStaffDetail ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack" style={{ maxWidth: 480 }}>
+            {(() => {
+              const detail = staffCreateDetails(auditStaffDetail);
+              const roleLabels: Record<string, string> = {
+                cashier: "Cashier",
+                barista: "Barista",
+                manager: "Manager",
+                owner: "Owner",
+              };
+              return (
+                <>
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                    <h2 style={{ margin: 0 }}>Created Staff</h2>
+                    <button type="button" className="ghost-btn tiny-btn" onClick={() => setAuditStaffDetail(null)}>✕ Close</button>
+                  </div>
+                  <div className="muted" style={{ fontSize: 13 }}>
+                    {new Date(String(auditStaffDetail.created_at)).toLocaleString()}
+                  </div>
+                  <div
+                    style={{
+                      border: "1px solid color-mix(in srgb, #6366f1 35%, var(--border))",
+                      background: "color-mix(in srgb, #6366f1 8%, #fff)",
+                      borderRadius: 14,
+                      padding: "16px 18px",
+                    }}
+                  >
+                    <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 10 }}>
+                      {detail.displayName || detail.staffCode || "Staff member"}
+                    </div>
+                    <div className="stack" style={{ gap: 8, fontSize: 14 }}>
+                      {detail.staffCode ? (
+                        <div className="row" style={{ justifyContent: "space-between" }}>
+                          <span className="muted">Staff code</span>
+                          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>{detail.staffCode}</span>
+                        </div>
+                      ) : null}
+                      {detail.displayName ? (
+                        <div className="row" style={{ justifyContent: "space-between" }}>
+                          <span className="muted">Display name</span>
+                          <span>{detail.displayName}</span>
+                        </div>
+                      ) : null}
+                      {detail.role ? (
+                        <div className="row" style={{ justifyContent: "space-between" }}>
+                          <span className="muted">Role</span>
+                          <span style={{ fontWeight: 600 }}>{roleLabels[detail.role] ?? detail.role}</span>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="row" style={{ marginTop: 4 }}>
+                    <button type="button" className="ghost-btn" onClick={() => setAuditStaffDetail(null)}>
+                      Close
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      ) : null}
+      {auditCategoryDetail ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack" style={{ maxWidth: 480 }}>
+            {(() => {
+              const detail = categoryCreateDetails(auditCategoryDetail);
+              return (
+                <>
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                    <h2 style={{ margin: 0 }}>Created Category</h2>
+                    <button type="button" className="ghost-btn tiny-btn" onClick={() => setAuditCategoryDetail(null)}>✕ Close</button>
+                  </div>
+                  <div className="muted" style={{ fontSize: 13 }}>
+                    {new Date(String(auditCategoryDetail.created_at)).toLocaleString()}
+                  </div>
+                  <div
+                    style={{
+                      border: "1px solid color-mix(in srgb, #8b5cf6 35%, var(--border))",
+                      background: "color-mix(in srgb, #8b5cf6 8%, #fff)",
+                      borderRadius: 14,
+                      padding: "16px 18px",
+                    }}
+                  >
+                    <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 10 }}>
+                      {detail.name}
+                    </div>
+                    <div className="stack" style={{ gap: 8, fontSize: 14 }}>
+                      <div className="row" style={{ justifyContent: "space-between" }}>
+                        <span className="muted">Product kind</span>
+                        <span>{detail.productKindLabel}</span>
+                      </div>
+                      <div className="row" style={{ justifyContent: "space-between" }}>
+                        <span className="muted">Sort order</span>
+                        <span>{String(detail.sortOrder)}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="row" style={{ marginTop: 4 }}>
+                    <button type="button" className="ghost-btn" onClick={() => setAuditCategoryDetail(null)}>
+                      Close
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      ) : null}
+      {auditRefundTicketId ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack" style={{ maxWidth: 440 }}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+              <h2 style={{ margin: 0 }}>Refund ticket</h2>
+              <button type="button" className="ghost-btn tiny-btn" onClick={() => setAuditRefundTicketId(null)}>✕ Close</button>
+            </div>
+            <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+              Ticket {auditRefundTicketId.slice(0, 8)}
+            </p>
+            <form className="stack" onSubmit={submitAuditRefund}>
+              <div className="label">Refund amount (PHP)</div>
+              <input className="field" name="amount" type="number" step="0.01" min="0.01" required placeholder="0.00" autoFocus />
+              <div className="label">Reason</div>
+              <input className="field" name="reason" placeholder="Customer request" defaultValue="Customer request" />
+              <div className="row" style={{ gap: 8, justifyContent: "flex-end" }}>
+                <button type="button" className="ghost-btn" onClick={() => setAuditRefundTicketId(null)}>Cancel</button>
+                <button type="submit" className="primary-btn">Record refund</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+      {inputDialogs}
+      {managerPinModal}
     </div>
   );
 }

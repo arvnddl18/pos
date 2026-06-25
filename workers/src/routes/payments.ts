@@ -2,19 +2,11 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../ctx.js";
 import { requireAuth } from "../middleware/session.js";
-import { requireManager } from "../middleware/rbac.js";
+import { verifyManagerCredentials } from "../lib/manager_auth.js";
 import { writeAudit } from "../audit.js";
 import { computeTicketDueCentavos, computeTicketTotals } from "../lib/ticket_totals.js";
+import { finalizeIfPaid, sumCompletedPaymentsCentavos } from "../lib/ticket_finalize.js";
 import { getTicketDetailPayload } from "./tickets.js";
-
-async function sumCompletedPaymentsCentavos(db: D1Database, ticketId: string): Promise<number> {
-  const res = await db.prepare(
-    `SELECT SUM(amount_centavos) as s FROM payments WHERE ticket_id = ? AND status = 'completed'`,
-  )
-    .bind(ticketId)
-    .first<{ s: number | null }>();
-  return Number(res?.s ?? 0);
-}
 
 export const paymentRoutes = new Hono<AppEnv>();
 
@@ -51,25 +43,18 @@ paymentRoutes.post("/tickets/:ticketId/payments", requireAuth(), async (c) => {
     .bind(auth.orgId)
     .first<{ reference_required: number | null }>();
 
-  const status =
-    body.tenderType === "cash"
-      ? "completed"
-      : body.tenderType.startsWith("e_wallet")
-        ? "pending_ewallet"
-        : "pending_ewallet";
+  const status = "completed";
 
   let settledAmountCentavos = body.amountCentavos;
-  if (body.tenderType === "cash") {
-    const due = await computeTicketDueCentavos(c.env.DB, ticketId);
-    const paid = await sumCompletedPaymentsCentavos(c.env.DB, ticketId);
-    const remainingDueCentavos = Math.max(0, due - paid);
-    if (body.amountCentavos < remainingDueCentavos) {
-      return c.json({ error: "insufficient_cash_amount", remainingDueCentavos }, 400);
-    }
-    settledAmountCentavos = Math.min(body.amountCentavos, remainingDueCentavos);
-    if (settledAmountCentavos <= 0) {
-      return c.json({ error: "ticket_already_paid" }, 400);
-    }
+  const due = await computeTicketDueCentavos(c.env.DB, ticketId);
+  const paid = await sumCompletedPaymentsCentavos(c.env.DB, ticketId);
+  const remainingDueCentavos = Math.max(0, due - paid);
+  if (body.amountCentavos < remainingDueCentavos) {
+    return c.json({ error: "insufficient_amount", remainingDueCentavos }, 400);
+  }
+  settledAmountCentavos = Math.min(body.amountCentavos, remainingDueCentavos);
+  if (settledAmountCentavos <= 0) {
+    return c.json({ error: "ticket_already_paid" }, 400);
   }
 
   if (body.tenderType !== "cash") {
@@ -79,8 +64,8 @@ paymentRoutes.post("/tickets/:ticketId/payments", requireAuth(), async (c) => {
   }
 
   await c.env.DB.prepare(
-    `INSERT INTO payments (id, ticket_id, tender_type, amount_centavos, status, idempotency_key, rounding_centavos, reference_note, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO payments (id, ticket_id, tender_type, amount_centavos, status, idempotency_key, rounding_centavos, reference_note, created_at, tendered_centavos)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       paymentId,
@@ -92,6 +77,7 @@ paymentRoutes.post("/tickets/:ticketId/payments", requireAuth(), async (c) => {
       body.roundingCentavos ?? 0,
       body.referenceNote ?? null,
       now,
+      body.amountCentavos,
     )
     .run();
 
@@ -126,21 +112,6 @@ paymentRoutes.post("/tickets/:ticketId/payments", requireAuth(), async (c) => {
   const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
   return c.json({ paymentId, status, ...payload });
 });
-
-async function finalizeIfPaid(db: D1Database, ticketId: string, orgId: string): Promise<boolean> {
-  const due = await computeTicketDueCentavos(db, ticketId);
-  const paid = await sumCompletedPaymentsCentavos(db, ticketId);
-  if (paid >= due) {
-    const now = new Date().toISOString();
-    const totals = await computeTicketTotals(db, ticketId);
-    const result = await db
-      .prepare(`UPDATE tickets SET status = 'paid', updated_at = ?, tax_centavos_snapshot = ? WHERE id = ? AND org_id = ?`)
-      .bind(now, totals.taxCentavos, ticketId, orgId)
-      .run();
-    return Number(result.meta.changes ?? 0) > 0;
-  }
-  return false;
-}
 
 const ConfirmIn = z.object({
   referenceNote: z.string().max(200).optional(),
@@ -209,6 +180,8 @@ const RefundIn = z.object({
   amountCentavos: z.number().int().positive(),
   reason: z.string().min(1),
   note: z.string().optional(),
+  approverStaffCode: z.string().min(1),
+  approverPin: z.string().min(4),
 });
 
 const CloseFreebieIn = z.object({
@@ -269,10 +242,13 @@ paymentRoutes.post("/tickets/:ticketId/close-freebie", requireAuth(), async (c) 
   return c.json({ ok: true, ...payload });
 });
 
-paymentRoutes.post("/tickets/:ticketId/refunds", requireAuth(), requireManager(), async (c) => {
+paymentRoutes.post("/tickets/:ticketId/refunds", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
   const ticketId = c.req.param("ticketId");
   const body = RefundIn.parse(await c.req.json());
+
+  const approver = await verifyManagerCredentials(c.env.DB, auth.orgId, body.approverStaffCode, body.approverPin);
+  if (!approver) return c.json({ error: "invalid_manager_credentials" }, 401);
 
   const ticket = await c.env.DB.prepare(`SELECT id, ticket_no FROM tickets WHERE id = ? AND org_id = ?`)
     .bind(ticketId, auth.orgId)
@@ -302,6 +278,7 @@ paymentRoutes.post("/tickets/:ticketId/refunds", requireAuth(), requireManager()
     .bind(id, ticketId, body.amountCentavos, body.reason, body.note ?? null, auth.id, now)
     .run();
 
+  const { approverStaffCode: _staffCode, approverPin: _pin, ...refundAuditPayload } = body;
   await writeAudit({
     db: c.env.DB,
     orgId: auth.orgId,
@@ -309,7 +286,7 @@ paymentRoutes.post("/tickets/:ticketId/refunds", requireAuth(), requireManager()
     action: "ticket.refund",
     entityType: "ticket",
     entityId: ticketId,
-    payload: { ...body, refundId: id, ticketNo: ticket.ticket_no },
+    payload: { ...refundAuditPayload, refundId: id, ticketNo: ticket.ticket_no, approvedBy: approver.id, approvedByStaffCode: approver.staffCode },
   });
 
   const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);

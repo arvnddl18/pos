@@ -64,6 +64,9 @@ export async function api<T = unknown>(path: string, init?: RequestInit & { json
       typeof data === "object" && data !== null && "error" in data
         ? String((data as { error?: unknown }).error ?? res.statusText)
         : String(text || res.statusText);
+    if (typeof window !== "undefined" && !path.includes("/auth/verify-owner-pin") && !path.includes("/auth/verify-manager-credentials")) {
+      window.dispatchEvent(new CustomEvent("pos:toast", { detail: { type: "error", message: errMessage } }));
+    }
     const err = new Error(errMessage);
     (err as Error & { status?: number; body?: unknown }).status = res.status;
     (err as Error & { body?: unknown }).body = data;

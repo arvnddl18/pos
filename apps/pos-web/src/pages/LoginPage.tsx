@@ -4,7 +4,6 @@ import { api } from "../api.js";
 
 export function LoginPage() {
   const navigate = useNavigate();
-  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -15,7 +14,6 @@ export function LoginPage() {
 
   async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    setError(null);
     const fd = new FormData(e.currentTarget);
     const staffCode = String(fd.get("staffCode") ?? "").trim();
     const pin = String(fd.get("pin") ?? "");
@@ -32,8 +30,8 @@ export function LoginPage() {
         },
       });
       navigate("/pos", { replace: true });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Login failed");
+    } catch {
+      // API error toast handled by api()
     } finally {
       setLoading(false);
     }
@@ -55,7 +53,6 @@ export function LoginPage() {
           <div className="label">Register ID (optional)</div>
           <input className="field" name="registerId" placeholder="UUID from Registers API" />
         </div>
-        {error ? <div className="error">{error}</div> : null}
         <button className="primary-btn" type="submit" disabled={loading}>
           {loading ? "Signing in…" : "Sign in"}
         </button>

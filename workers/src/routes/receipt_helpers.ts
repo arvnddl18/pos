@@ -28,12 +28,16 @@ export async function buildReceiptPayload(db: D1Database, ticketId: string, orgI
   const textLines: string[] = [];
   const ticketNoNum = Number(t.ticket_no ?? 0);
   const ticketNoLabel = ticketNoNum > 0 ? `#${String(ticketNoNum).padStart(4, "0")}` : String(t.id).slice(0, 8);
+  const isVoidedTicket = String(t.status) === "voided";
   textLines.push(org?.name ?? "Receipt");
   textLines.push(`Ticket No.: ${ticketNoLabel}`);
   textLines.push(`Status: ${t.status}`);
+  if (isVoidedTicket && t.notes) {
+    textLines.push(`Void reason: ${String(t.notes)}`);
+  }
   textLines.push("---");
   for (const li of lines.results ?? []) {
-    if (li.voided === 1) continue;
+    if (!isVoidedTicket && li.voided === 1) continue;
     const name = String(li.product_name ?? "Item");
     const qty = Number(li.qty);
     const unit = Number(li.unit_price_centavos);
@@ -41,13 +45,14 @@ export async function buildReceiptPayload(db: D1Database, ticketId: string, orgI
     const disc = Number(li.discount_centavos ?? 0);
     const lineTotal = gross - disc;
     const freebie = gross > 0 && disc >= gross;
+    const voidPrefix = isVoidedTicket && li.voided === 1 ? "[VOID] " : "";
 
     if (disc > 0 && !freebie) {
-      textLines.push(`${qty}× ${name}  ${peso(gross)} PHP`);
+      textLines.push(`${voidPrefix}${qty}× ${name}  ${peso(gross)} PHP`);
       textLines.push(`   Discount    -${peso(disc)} PHP`);
       textLines.push(`   Line total   ${peso(lineTotal)} PHP`);
     } else {
-      textLines.push(`${qty}× ${name}${freebie ? " [FREEBIE]" : ""}  ${peso(lineTotal)} PHP`);
+      textLines.push(`${voidPrefix}${qty}× ${name}${freebie ? " [FREEBIE]" : ""}  ${peso(lineTotal)} PHP`);
     }
 
     const lineNotes = String(li.line_notes ?? "").trim();
@@ -90,9 +95,26 @@ export async function buildReceiptPayload(db: D1Database, ticketId: string, orgI
   textLines.push(`TOTAL: ${peso(totals.dueCentavos)} PHP`);
   const paidCompletedCentavos = Number(paid?.s ?? 0);
   const remainingDueCentavos = Math.max(0, totals.dueCentavos - paidCompletedCentavos);
-  const changeCentavos = Math.max(0, paidCompletedCentavos - totals.dueCentavos);
+  
+  let totalTenderedCentavos = 0;
+  const methods = new Set<string>();
+  for (const p of pays.results ?? []) {
+    if (p.status === 'completed') {
+       totalTenderedCentavos += Number(p.tendered_centavos ?? p.amount_centavos ?? 0);
+       let m = String(p.tender_type);
+       if (m === "e_wallet_personal") m = "GCash";
+       else if (m === "e_wallet_merchant") m = "Bank Transfer";
+       else if (m === "cash") m = "Cash";
+       methods.add(m);
+    }
+  }
+
+  const changeCentavos = Math.max(0, totalTenderedCentavos - totals.dueCentavos);
+  if (methods.size > 0) {
+    textLines.push(`Method: ${Array.from(methods).join(", ")}`);
+  }
   textLines.push(`Paid: ${peso(paidCompletedCentavos)} PHP`);
-  textLines.push(`Tendered: ${peso(paidCompletedCentavos)} PHP`);
+  textLines.push(`Tendered: ${peso(totalTenderedCentavos)} PHP`);
   textLines.push(`Remaining due: ${peso(remainingDueCentavos)} PHP`);
   textLines.push(`Change: ${peso(changeCentavos)} PHP`);
 

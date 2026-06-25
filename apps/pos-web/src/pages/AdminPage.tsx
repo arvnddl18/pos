@@ -1,5 +1,8 @@
 import { FormEvent, useEffect, useState } from "react";
 import { api, formatPhp } from "../api.js";
+import { useToast } from "../ui/ToastProvider.js";
+import { OwnerPinCancelledError, useOwnerPinConfirm } from "../ui/useOwnerPinConfirm.js";
+import { useInputDialogs } from "../ui/useInputDialogs.js";
 
 type Product = Record<string, unknown>;
 type Category = { id: string; name: string; sort_order: number; product_kind?: string };
@@ -16,16 +19,22 @@ export function AdminPage() {
   const [taxProfiles, setTaxProfiles] = useState<TaxProfile[]>([]);
   const [modGroups, setModGroups] = useState<ModGroup[]>([]);
   const [modifiers, setModifiers] = useState<Modifier[]>([]);
-  const [msg, setMsg] = useState<string | null>(null);
+  const { pushToast } = useToast();
+  const { confirmOwnerPin, ownerPinModal } = useOwnerPinConfirm();
+  const { confirm, inputDialogs } = useInputDialogs();
   const [showAddProduct, setShowAddProduct] = useState(false);
   const [showEditProduct, setShowEditProduct] = useState(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [editProductModGroupId, setEditProductModGroupId] = useState<string>("");
   const [showLinkGroup, setShowLinkGroup] = useState(false);
   const [showAddCategory, setShowAddCategory] = useState(false);
+  const [editingCategory, setEditingCategory] = useState<Category | null>(null);
   const [showAddTax, setShowAddTax] = useState(false);
+  const [editingTax, setEditingTax] = useState<TaxProfile | null>(null);
   const [showAddModGroup, setShowAddModGroup] = useState(false);
+  const [editingModGroup, setEditingModGroup] = useState<ModGroup | null>(null);
   const [showAddModifier, setShowAddModifier] = useState(false);
+  const [editingModifier, setEditingModifier] = useState<Modifier | null>(null);
   const [productPage, setProductPage] = useState(1);
   const [categoryPage, setCategoryPage] = useState(1);
   const [taxPage, setTaxPage] = useState(1);
@@ -61,6 +70,20 @@ export function AdminPage() {
 
   function actionButtonClassName(tone: "default" | "danger" = "default") {
     return tone === "danger" ? "ghost-btn admin-action-btn is-danger" : "ghost-btn admin-action-btn";
+  }
+
+  async function runCatalogAction(title: string, successMessage: string, action: () => Promise<void>) {
+    try {
+      await confirmOwnerPin({
+        title: "Owner confirmation",
+        description: title,
+        action,
+      });
+      pushToast("success", successMessage);
+      await reloadAll();
+    } catch (err) {
+      if (err instanceof OwnerPinCancelledError) return;
+    }
   }
 
   async function uploadProductImage(file: File): Promise<string> {
@@ -128,12 +151,12 @@ export function AdminPage() {
 
   async function createProduct(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    setMsg(null);
     const fd = new FormData(e.currentTarget);
     const categoryId = String(fd.get("categoryId") ?? "").trim();
     const taxId = String(fd.get("taxProfileId") ?? "").trim();
     const imageFile = fd.get("imageFile");
-    try {
+    const productName = String(fd.get("name") ?? "").trim() || "product";
+    await runCatalogAction(`Create product "${productName}"`, "Product created", async () => {
       let imageR2Key: string | null = null;
       if (imageFile instanceof File && imageFile.size > 0) {
         imageR2Key = await uploadProductImage(imageFile);
@@ -164,26 +187,24 @@ export function AdminPage() {
       }
       e.currentTarget.reset();
       setShowAddProduct(false);
-      setMsg("Product created");
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Error");
-    }
+    });
   }
 
-  async function patchProduct(id: string, patch: Record<string, unknown>) {
-    await api(`/catalog/products/${id}`, { method: "PATCH", json: patch });
-    setMsg("Updated");
+  async function patchProduct(id: string, patch: Record<string, unknown>, label: string, successMessage: string) {
+    await runCatalogAction(label, successMessage, async () => {
+      await api(`/catalog/products/${id}`, { method: "PATCH", json: patch });
+    });
   }
 
   async function updateProduct(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!editingProduct) return;
-    setMsg(null);
     const fd = new FormData(e.currentTarget);
     const categoryId = String(fd.get("categoryId") ?? "").trim();
     const taxId = String(fd.get("taxProfileId") ?? "").trim();
     const imageFile = fd.get("imageFile");
-    try {
+    const productName = String(fd.get("name") ?? "").trim() || String(editingProduct.name ?? "product");
+    await runCatalogAction(`Update product "${productName}"`, "Product updated", async () => {
       let imageR2Key: string | null | undefined = undefined;
       if (imageFile instanceof File && imageFile.size > 0) {
         imageR2Key = await uploadProductImage(imageFile);
@@ -228,26 +249,27 @@ export function AdminPage() {
       setShowEditProduct(false);
       setEditingProduct(null);
       setEditProductModGroupId("");
-      setMsg("Product updated");
-      void reloadAll();
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Error");
-    }
+    });
   }
 
-  async function removeProduct(id: string) {
-    if (!window.confirm("Remove this product?")) return;
-    await api(`/catalog/products/${id}`, { method: "DELETE", json: {} });
-    setMsg("Product removed");
+  async function removeProduct(id: string, name: string) {
+    const ok = await confirm({
+      title: "Remove product",
+      message: `Remove product "${name}"? This cannot be undone.`,
+      confirmLabel: "Remove",
+      danger: true,
+    });
+    if (!ok) return;
+    await runCatalogAction(`Remove product "${name}"`, "Product removed", async () => {
+      await api(`/catalog/products/${id}`, { method: "DELETE", json: {} });
+    });
   }
-
-
 
   async function createCategory(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    setMsg(null);
     const fd = new FormData(e.currentTarget);
-    try {
+    const categoryName = String(fd.get("name") ?? "").trim() || "category";
+    await runCatalogAction(`Create category "${categoryName}"`, "Category created", async () => {
       await api("/catalog/categories", {
         method: "POST",
         json: {
@@ -258,73 +280,86 @@ export function AdminPage() {
       });
       e.currentTarget.reset();
       setShowAddCategory(false);
-      setMsg("Category created");
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Error creating category");
-    }
+    });
   }
 
-  async function editCategory(category: Category) {
-    const name = window.prompt("Category name", category.name);
-    if (!name || !name.trim()) return;
-    const sortRaw = window.prompt("Sort order", String(category.sort_order));
-    if (sortRaw === null) return;
-    const kindRaw = window.prompt("Type: cup (drinks) or item (food)", category.product_kind ?? "cup");
-    if (kindRaw === null) return;
-    const productKind = kindRaw.trim().toLowerCase() === "item" ? "item" : "cup";
-    await api(`/catalog/categories/${category.id}`, {
-      method: "PATCH",
-      json: { name: name.trim(), sortOrder: Number(sortRaw) || 0, productKind },
+  async function updateCategory(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!editingCategory) return;
+    const fd = new FormData(e.currentTarget);
+    const categoryName = String(fd.get("name") ?? "").trim() || editingCategory.name;
+    await runCatalogAction(`Update category "${categoryName}"`, "Category updated", async () => {
+      await api(`/catalog/categories/${editingCategory.id}`, {
+        method: "PATCH",
+        json: {
+          name: String(fd.get("name")),
+          sortOrder: Number(fd.get("sort") ?? 0),
+          productKind: String(fd.get("productKind") ?? "cup") === "item" ? "item" : "cup",
+        },
+      });
+      setEditingCategory(null);
     });
-    setMsg("Category updated");
   }
 
   async function removeCategory(category: Category) {
-    if (!window.confirm(`Remove category "${category.name}"?`)) return;
-    await api(`/catalog/categories/${category.id}`, { method: "DELETE", json: {} });
-    setMsg("Category removed");
+    const ok = await confirm({
+      title: "Remove category",
+      message: `Remove category "${category.name}"?`,
+      confirmLabel: "Remove",
+      danger: true,
+    });
+    if (!ok) return;
+    await runCatalogAction(`Remove category "${category.name}"`, "Category removed", async () => {
+      await api(`/catalog/categories/${category.id}`, { method: "DELETE", json: {} });
+    });
   }
 
   async function createTax(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    setMsg(null);
     const fd = new FormData(e.currentTarget);
-    try {
+    const taxName = String(fd.get("name") ?? "").trim() || "tax profile";
+    await runCatalogAction(`Create tax profile "${taxName}"`, "Tax profile created", async () => {
       await api("/catalog/tax-profiles", {
         method: "POST",
         json: { name: String(fd.get("name")), rateBps: Math.round(Number(fd.get("ratePct") ?? 0) * 100) },
       });
       e.currentTarget.reset();
       setShowAddTax(false);
-      setMsg("Tax profile created");
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Error creating tax profile");
-    }
+    });
   }
 
-  async function editTaxProfile(taxProfile: TaxProfile) {
-    const name = window.prompt("Tax profile name", taxProfile.name);
-    if (!name || !name.trim()) return;
-    const rateRaw = window.prompt("Rate %", (taxProfile.rate_bps / 100).toFixed(2));
-    if (rateRaw === null) return;
-    await api(`/catalog/tax-profiles/${taxProfile.id}`, {
-      method: "PATCH",
-      json: { name: name.trim(), rateBps: Math.round((Number(rateRaw) || 0) * 100) },
+  async function updateTaxProfile(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!editingTax) return;
+    const fd = new FormData(e.currentTarget);
+    const taxName = String(fd.get("name") ?? "").trim() || editingTax.name;
+    await runCatalogAction(`Update tax profile "${taxName}"`, "Tax profile updated", async () => {
+      await api(`/catalog/tax-profiles/${editingTax.id}`, {
+        method: "PATCH",
+        json: { name: String(fd.get("name")), rateBps: Math.round((Number(fd.get("ratePct")) || 0) * 100) },
+      });
+      setEditingTax(null);
     });
-    setMsg("Tax profile updated");
   }
 
   async function removeTaxProfile(taxProfile: TaxProfile) {
-    if (!window.confirm(`Remove tax profile "${taxProfile.name}"?`)) return;
-    await api(`/catalog/tax-profiles/${taxProfile.id}`, { method: "DELETE", json: {} });
-    setMsg("Tax profile removed");
+    const ok = await confirm({
+      title: "Remove tax profile",
+      message: `Remove tax profile "${taxProfile.name}"?`,
+      confirmLabel: "Remove",
+      danger: true,
+    });
+    if (!ok) return;
+    await runCatalogAction(`Remove tax profile "${taxProfile.name}"`, "Tax profile removed", async () => {
+      await api(`/catalog/tax-profiles/${taxProfile.id}`, { method: "DELETE", json: {} });
+    });
   }
 
   async function createModGroup(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    setMsg(null);
     const fd = new FormData(e.currentTarget);
-    try {
+    const groupName = String(fd.get("name") ?? "").trim() || "modifier group";
+    await runCatalogAction(`Create modifier group "${groupName}"`, "Modifier group created", async () => {
       await api("/catalog/modifier-groups", {
         method: "POST",
         json: {
@@ -337,85 +372,100 @@ export function AdminPage() {
       });
       e.currentTarget.reset();
       setShowAddModGroup(false);
-      setMsg("Modifier group created");
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Error creating modifier group");
-    }
+    });
   }
 
-  async function editModifierGroup(group: ModGroup) {
-    const name = window.prompt("Modifier group name", group.name);
-    if (!name || !name.trim()) return;
-    await api(`/catalog/modifier-groups/${group.id}`, {
-      method: "PATCH",
-      json: {
-        name: name.trim(),
-        required: group.required === 1,
-        minSelect: group.min_select,
-        maxSelect: group.max_select,
-        exclusive: group.exclusive === 1,
-      },
+  async function updateModifierGroup(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!editingModGroup) return;
+    const fd = new FormData(e.currentTarget);
+    const groupName = String(fd.get("name") ?? "").trim() || editingModGroup.name;
+    await runCatalogAction(`Update modifier group "${groupName}"`, "Modifier group updated", async () => {
+      await api(`/catalog/modifier-groups/${editingModGroup.id}`, {
+        method: "PATCH",
+        json: {
+          name: String(fd.get("name")),
+          required: editingModGroup.required === 1,
+          minSelect: editingModGroup.min_select,
+          maxSelect: editingModGroup.max_select,
+          exclusive: editingModGroup.exclusive === 1,
+        },
+      });
+      setEditingModGroup(null);
     });
-    setMsg("Modifier group updated");
   }
 
   async function removeModifierGroup(group: ModGroup) {
-    if (!window.confirm(`Remove modifier group "${group.name}" and its modifiers?`)) return;
-    await api(`/catalog/modifier-groups/${group.id}`, { method: "DELETE", json: {} });
-    setMsg("Modifier group removed");
+    const ok = await confirm({
+      title: "Remove modifier group",
+      message: `Remove modifier group "${group.name}" and its modifiers?`,
+      confirmLabel: "Remove",
+      danger: true,
+    });
+    if (!ok) return;
+    await runCatalogAction(`Remove modifier group "${group.name}"`, "Modifier group removed", async () => {
+      await api(`/catalog/modifier-groups/${group.id}`, { method: "DELETE", json: {} });
+    });
   }
 
   async function addModifier(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    setMsg(null);
     const fd = new FormData(e.currentTarget);
     const gid = String(fd.get("groupId"));
-    try {
+    const modifierName = String(fd.get("mname") ?? "").trim() || "modifier";
+    await runCatalogAction(`Add modifier "${modifierName}"`, "Modifier added", async () => {
       await api(`/catalog/modifier-groups/${gid}/modifiers`, {
         method: "POST",
         json: { name: String(fd.get("mname")), priceAdjustCentavos: Math.round(Number(fd.get("adjPhp") ?? 0) * 100) },
       });
       e.currentTarget.reset();
       setShowAddModifier(false);
-      setMsg("Modifier added");
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Error adding modifier");
-    }
+    });
   }
 
-  async function editModifier(modifier: Modifier) {
-    const name = window.prompt("Modifier name", modifier.name);
-    if (!name || !name.trim()) return;
-    const priceRaw = window.prompt("Price adjust PHP", (modifier.price_adjust_centavos / 100).toFixed(2));
-    if (priceRaw === null) return;
-    await api(`/catalog/modifiers/${modifier.id}`, {
-      method: "PATCH",
-      json: { name: name.trim(), priceAdjustCentavos: Math.round((Number(priceRaw) || 0) * 100) },
+  async function updateModifier(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!editingModifier) return;
+    const fd = new FormData(e.currentTarget);
+    const modifierName = String(fd.get("name") ?? "").trim() || editingModifier.name;
+    await runCatalogAction(`Update modifier "${modifierName}"`, "Modifier updated", async () => {
+      await api(`/catalog/modifiers/${editingModifier.id}`, {
+        method: "PATCH",
+        json: {
+          name: String(fd.get("name")),
+          priceAdjustCentavos: Math.round((Number(fd.get("adjPhp")) || 0) * 100),
+        },
+      });
+      setEditingModifier(null);
     });
-    setMsg("Modifier updated");
   }
 
   async function removeModifier(modifier: Modifier) {
-    if (!window.confirm(`Remove modifier "${modifier.name}"?`)) return;
-    await api(`/catalog/modifiers/${modifier.id}`, { method: "DELETE", json: {} });
-    setMsg("Modifier removed");
+    const ok = await confirm({
+      title: "Remove modifier",
+      message: `Remove modifier "${modifier.name}"?`,
+      confirmLabel: "Remove",
+      danger: true,
+    });
+    if (!ok) return;
+    await runCatalogAction(`Remove modifier "${modifier.name}"`, "Modifier removed", async () => {
+      await api(`/catalog/modifiers/${modifier.id}`, { method: "DELETE", json: {} });
+    });
   }
 
   async function linkGroup(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    setMsg(null);
     const fd = new FormData(e.currentTarget);
-    try {
-      await api(`/catalog/products/${String(fd.get("productId"))}/modifier-groups`, {
+    const productId = String(fd.get("productId"));
+    const productName = String(products.find((p) => String(p.id) === productId)?.name ?? "product");
+    await runCatalogAction(`Link modifier group to "${productName}"`, "Modifier group linked", async () => {
+      await api(`/catalog/products/${productId}/modifier-groups`, {
         method: "POST",
         json: { modifierGroupId: String(fd.get("groupId")) },
       });
       e.currentTarget.reset();
       setShowLinkGroup(false);
-      setMsg("Linked");
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Error linking modifier group");
-    }
+    });
   }
 
   return (
@@ -431,7 +481,6 @@ export function AdminPage() {
           </button>
         ))}
       </div>
-      {msg ? <div className="muted">{msg}</div> : null}
 
       {tab === "products" ? (
         <div className="card stack">
@@ -471,7 +520,14 @@ export function AdminPage() {
                         <button
                           type="button"
                           className={actionButtonClassName()}
-                          onClick={() => void patchProduct(String(p.id), { outOfStock: p.out_of_stock !== 1 })}
+                          onClick={() =>
+                            void patchProduct(
+                              String(p.id),
+                              { outOfStock: p.out_of_stock !== 1 },
+                              `Update stock for "${String(p.name)}"`,
+                              p.out_of_stock !== 1 ? "Product marked out of stock" : "Product marked in stock",
+                            )
+                          }
                         >
                           <span className="btn-icon" aria-hidden="true">
                             📦
@@ -481,7 +537,14 @@ export function AdminPage() {
                         <button
                           type="button"
                           className={actionButtonClassName()}
-                          onClick={() => void patchProduct(String(p.id), { isActive: p.is_active === 0 })}
+                          onClick={() =>
+                            void patchProduct(
+                              String(p.id),
+                              { isActive: p.is_active === 0 },
+                              `Update status for "${String(p.name)}"`,
+                              p.is_active === 0 ? "Product activated" : "Product deactivated",
+                            )
+                          }
                         >
                           <span className="btn-icon" aria-hidden="true">
                             ⚡
@@ -501,7 +564,7 @@ export function AdminPage() {
                           </span>
                           <span>Edit</span>
                         </button>
-                        <button type="button" className={actionButtonClassName("danger")} onClick={() => void removeProduct(String(p.id))}>
+                        <button type="button" className={actionButtonClassName("danger")} onClick={() => void removeProduct(String(p.id), String(p.name))}>
                           <span className="btn-icon" aria-hidden="true">
                             🗑
                           </span>
@@ -566,7 +629,7 @@ export function AdminPage() {
                     <td>{c.sort_order}</td>
                     <td>
                       <div className="row admin-table-actions">
-                        <button type="button" className={actionButtonClassName()} onClick={() => void editCategory(c)}>
+                        <button type="button" className={actionButtonClassName()} onClick={() => setEditingCategory(c)}>
                           <span className="btn-icon" aria-hidden="true">
                             ✏
                           </span>
@@ -635,7 +698,7 @@ export function AdminPage() {
                     <td>{(tp.rate_bps / 100).toFixed(2)}%</td>
                     <td>
                       <div className="row admin-table-actions">
-                        <button type="button" className={actionButtonClassName()} onClick={() => void editTaxProfile(tp)}>
+                        <button type="button" className={actionButtonClassName()} onClick={() => setEditingTax(tp)}>
                           <span className="btn-icon" aria-hidden="true">
                             ✏
                           </span>
@@ -704,7 +767,7 @@ export function AdminPage() {
                       <td>{g.max_select}</td>
                       <td>
                         <div className="row admin-table-actions">
-                          <button type="button" className={actionButtonClassName()} onClick={() => void editModifierGroup(g)}>
+                          <button type="button" className={actionButtonClassName()} onClick={() => setEditingModGroup(g)}>
                             <span className="btn-icon" aria-hidden="true">
                               ✏
                             </span>
@@ -777,7 +840,7 @@ export function AdminPage() {
                       <td>{formatPhp(m.price_adjust_centavos)}</td>
                       <td>
                         <div className="row admin-table-actions">
-                          <button type="button" className={actionButtonClassName()} onClick={() => void editModifier(m)}>
+                          <button type="button" className={actionButtonClassName()} onClick={() => setEditingModifier(m)}>
                             <span className="btn-icon" aria-hidden="true">
                               ✏
                             </span>
@@ -1126,6 +1189,89 @@ export function AdminPage() {
           </div>
         </div>
       ) : null}
+
+      {editingCategory ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <h2 style={{ margin: 0 }}>Edit category</h2>
+              <button type="button" className="ghost-btn" onClick={() => setEditingCategory(null)}>
+                <span className="btn-icon">✕</span>
+                <span>Close</span>
+              </button>
+            </div>
+            <form className="stack" onSubmit={updateCategory}>
+              <input className="field" name="name" required defaultValue={editingCategory.name} placeholder="Category name" />
+              <div className="label">Product type</div>
+              <select className="field" name="productKind" defaultValue={editingCategory.product_kind ?? "cup"}>
+                <option value="cup">Cup — drinks (latte, coffee, etc.)</option>
+                <option value="item">Item — food (scrolls, snacks, etc.)</option>
+              </select>
+              <input className="field" name="sort" type="number" defaultValue={editingCategory.sort_order} placeholder="Sort order" />
+              <button className="primary-btn" type="submit">Save changes</button>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {editingTax ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <h2 style={{ margin: 0 }}>Edit tax profile</h2>
+              <button type="button" className="ghost-btn" onClick={() => setEditingTax(null)}>
+                <span className="btn-icon">✕</span>
+                <span>Close</span>
+              </button>
+            </div>
+            <form className="stack" onSubmit={updateTaxProfile}>
+              <input className="field" name="name" defaultValue={editingTax.name} placeholder="VAT 12%" required />
+              <input className="field" name="ratePct" type="number" step="0.01" defaultValue={(editingTax.rate_bps / 100).toFixed(2)} placeholder="Rate % (e.g. 12)" required />
+              <button className="primary-btn" type="submit">Save changes</button>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {editingModGroup ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <h2 style={{ margin: 0 }}>Edit modifier group</h2>
+              <button type="button" className="ghost-btn" onClick={() => setEditingModGroup(null)}>
+                <span className="btn-icon">✕</span>
+                <span>Close</span>
+              </button>
+            </div>
+            <form className="stack" onSubmit={updateModifierGroup}>
+              <input className="field" name="name" required defaultValue={editingModGroup.name} placeholder="e.g. Size" />
+              <button className="primary-btn" type="submit">Save changes</button>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {editingModifier ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <h2 style={{ margin: 0 }}>Edit modifier</h2>
+              <button type="button" className="ghost-btn" onClick={() => setEditingModifier(null)}>
+                <span className="btn-icon">✕</span>
+                <span>Close</span>
+              </button>
+            </div>
+            <form className="stack" onSubmit={updateModifier}>
+              <input className="field" name="name" defaultValue={editingModifier.name} placeholder="Modifier name" required />
+              <input className="field" name="adjPhp" type="number" step="0.01" defaultValue={(editingModifier.price_adjust_centavos / 100).toFixed(2)} placeholder="Price + PHP (can be 0)" />
+              <button className="primary-btn" type="submit">Save changes</button>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {ownerPinModal}
+      {inputDialogs}
     </div>
   );
 }

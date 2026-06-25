@@ -1,8 +1,16 @@
 import { createMiddleware } from "hono/factory";
+import { canManage, type Role } from "@pos/shared";
 import type { AppEnv } from "../ctx.js";
 
-function canManage(role: string): boolean {
-  return role === "manager" || role === "owner";
+export function requireRole(...allowed: Role[]) {
+  return createMiddleware<AppEnv>(async (c, next) => {
+    const auth = c.get("auth");
+    if (!auth) return c.json({ error: "unauthorized" }, 401);
+    if (!allowed.includes(auth.role)) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+    await next();
+  });
 }
 
 export function requireManager() {

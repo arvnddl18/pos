@@ -1,11 +1,11 @@
 import { FormEvent, useEffect, useState } from "react";
 import { api } from "../api.js";
+import { emitToast } from "../ui/ToastProvider.js";
 
 type User = Record<string, unknown>;
 
 export function StaffPage() {
   const [users, setUsers] = useState<User[]>([]);
-  const [msg, setMsg] = useState<string | null>(null);
 
   async function load() {
     const res = await api<{ users: User[] }>("/staff/users");
@@ -27,17 +27,21 @@ export function StaffPage() {
   async function createUser(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const fd = new FormData(e.currentTarget);
-    await api("/staff/users", {
-      method: "POST",
-      json: {
-        staffCode: String(fd.get("staffCode") ?? ""),
-        displayName: String(fd.get("displayName") ?? ""),
-        pin: String(fd.get("pin") ?? ""),
-        role: String(fd.get("role") ?? "cashier"),
-      },
-    });
-    e.currentTarget.reset();
-    setMsg("Created");
+    try {
+      await api("/staff/users", {
+        method: "POST",
+        json: {
+          staffCode: String(fd.get("staffCode") ?? ""),
+          displayName: String(fd.get("displayName") ?? ""),
+          pin: String(fd.get("pin") ?? ""),
+          role: String(fd.get("role") ?? "cashier"),
+        },
+      });
+      e.currentTarget.reset();
+      emitToast("success", "Staff user created");
+    } catch {
+      // API error toast handled by api()
+    }
   }
 
   return (
@@ -54,7 +58,6 @@ export function StaffPage() {
           <option value="manager">manager</option>
           <option value="owner">owner</option>
         </select>
-        {msg ? <div className="muted">{msg}</div> : null}
         <button className="primary-btn" type="submit">
           Create
         </button>

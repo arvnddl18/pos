@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
 
-type QueueLine = { qty: number; product_name: string };
+type QueueLine = { qty: number; product_name: string; line_notes?: string };
 type QueueRow = {
   id: string;
   ticket_no?: number | null;
@@ -12,6 +12,7 @@ type QueueRow = {
   created_at?: string;
   updated_at?: string;
   lines?: QueueLine[];
+  notes?: string | null;
 };
 type TicketLine = {
   id: string;
@@ -19,6 +20,7 @@ type TicketLine = {
   unit_price_centavos: number;
   discount_centavos?: number | null;
   product_name?: string;
+  line_notes?: string | null;
 };
 type TicketDetail = { ticket: QueueRow; lines: TicketLine[] };
 
@@ -54,6 +56,10 @@ function kdsCardClass(ticket: QueueRow) {
 
 function isParkedTicket(ticket: QueueRow) {
   return ticket.status === "parked";
+}
+
+function isPaidTicket(ticket: QueueRow) {
+  return ticket.status === "paid";
 }
 
 export function KdsPage() {
@@ -141,44 +147,83 @@ export function KdsPage() {
     }
   }
 
+  const preparingTickets = rows.filter((t) => isParkedTicket(t) || t.kds_state !== "ready");
+  const readyTickets = rows.filter((t) => !isParkedTicket(t) && t.kds_state === "ready");
+
+  const renderTicket = (t: QueueRow) => {
+    const lines = t.lines ?? [];
+    const parked = isParkedTicket(t);
+    return (
+      <button
+        key={String(t.id)}
+        className={`tile kds-card ${kdsCardClass(t)}`}
+        type="button"
+        onClick={() => void openTicket(String(t.id))}
+      >
+        <div className="kds-card-top">
+          <div className="kds-card-number">{formatTicketLabel(t)}</div>
+          <div className="kds-card-badges">
+            {parked ? <span className="kds-badge kds-parked">Parked</span> : null}
+            {!parked && isPaidTicket(t) ? <span className="kds-badge kds-paid">Paid</span> : null}
+          </div>
+        </div>
+        <div className="kds-card-datetime">{formatOrderDateTime(t.created_at) || "—"}</div>
+        <div className="kds-card-type">{String(t.ticket_type ?? "takeout").replace("_", " ")}</div>
+        {t.notes ? (
+          <div className="kds-card-note" style={{ color: "var(--color-primary)", fontWeight: "bold", fontSize: "0.9em", padding: "4px 0" }}>
+            Note: {t.notes}
+          </div>
+        ) : null}
+        <ul className="kds-card-lines" aria-label="Order items">
+          {lines.length ? (
+            lines.map((line, idx) => (
+              <li key={`${t.id}-${idx}`} className="kds-card-line" style={{ display: "flex", flexDirection: "column", gap: 2, alignItems: "flex-start" }}>
+                <div style={{ display: "flex", gap: "0.5rem" }}>
+                  <span className="kds-card-line-qty">{line.qty}×</span>
+                  <span className="kds-card-line-name">{line.product_name}</span>
+                </div>
+                {line.line_notes && line.line_notes !== "[FREEBIE]" ? (
+                  <div style={{ fontSize: "0.85em", color: "var(--color-primary)", fontWeight: 600, paddingLeft: "1.8em" }}>
+                    Note: {line.line_notes.replace("[FREEBIE] ", "").replace("[FREEBIE]", "")}
+                  </div>
+                ) : null}
+              </li>
+            ))
+          ) : (
+            <li className="kds-card-line muted">No items</li>
+          )}
+        </ul>
+        {!parked ? (
+          <div className={`kds-badge ${kdsStateClass(t.kds_state)}`}>KDS: {String(t.kds_state ?? "preparing")}</div>
+        ) : null}
+      </button>
+    );
+  };
+
   return (
-    <div className="page-shell" style={{ gap: 12 }}>
-      <h1 className="page-title">Kitchen display</h1>
-      <div className="grid-products">
-        {rows.map((t) => {
-          const lines = t.lines ?? [];
-          const parked = isParkedTicket(t);
-          return (
-            <button
-              key={String(t.id)}
-              className={`tile kds-card ${kdsCardClass(t)}`}
-              type="button"
-              onClick={() => void openTicket(String(t.id))}
-            >
-              <div className="kds-card-top">
-                <div className="kds-card-number">{formatTicketLabel(t)}</div>
-                {parked ? <span className="kds-badge kds-parked">Parked</span> : null}
-              </div>
-              <div className="kds-card-datetime">{formatOrderDateTime(t.created_at) || "—"}</div>
-              <div className="kds-card-type">{String(t.ticket_type ?? "takeout").replace("_", " ")}</div>
-              <ul className="kds-card-lines" aria-label="Order items">
-                {lines.length ? (
-                  lines.map((line, idx) => (
-                    <li key={`${t.id}-${idx}`} className="kds-card-line">
-                      <span className="kds-card-line-qty">{line.qty}×</span>
-                      <span className="kds-card-line-name">{line.product_name}</span>
-                    </li>
-                  ))
-                ) : (
-                  <li className="kds-card-line muted">No items</li>
-                )}
-              </ul>
-              {!parked ? (
-                <div className={`kds-badge ${kdsStateClass(t.kds_state)}`}>KDS: {String(t.kds_state ?? "preparing")}</div>
-              ) : null}
-            </button>
-          );
-        })}
+    <div className="page-shell" style={{ gap: 24 }}>
+      <h1 className="page-title" style={{ margin: 0 }}>Kitchen display</h1>
+      
+      <div className="stack" style={{ gap: 12 }}>
+        <h2 style={{ margin: 0 }}>Preparing</h2>
+        <div className="grid-products">
+          {preparingTickets.length > 0 ? (
+            preparingTickets.map(renderTicket)
+          ) : (
+            <div className="muted">No tickets preparing</div>
+          )}
+        </div>
+      </div>
+
+      <div className="stack" style={{ gap: 12 }}>
+        <h2 style={{ margin: 0 }}>Ready to Serve</h2>
+        <div className="grid-products">
+          {readyTickets.length > 0 ? (
+            readyTickets.map(renderTicket)
+          ) : (
+            <div className="muted">No tickets ready</div>
+          )}
+        </div>
       </div>
       {selectedTicket ? (
         <div className="sheet" role="dialog">
@@ -193,7 +238,13 @@ export function KdsPage() {
               {formatOrderDateTime(selectedTicket.ticket.created_at)} · {String(selectedTicket.ticket.ticket_type ?? "takeout")} · KDS:{" "}
               {String(selectedTicket.ticket.kds_state ?? "preparing")}
               {isParkedTicket(selectedTicket.ticket) ? " · Parked" : ""}
+              {isPaidTicket(selectedTicket.ticket) ? " · Paid" : ""}
             </div>
+            {selectedTicket.ticket.notes ? (
+              <div style={{ color: "var(--color-primary)", fontWeight: "bold", padding: "8px 0" }}>
+                Note: {selectedTicket.ticket.notes}
+              </div>
+            ) : null}
             {isParkedTicket(selectedTicket.ticket) ? (
               <div className="kds-badge kds-parked">Parked</div>
             ) : (
@@ -203,27 +254,41 @@ export function KdsPage() {
             )}
             <div className="stack" style={{ gap: 8 }}>
               {selectedTicket.lines.map((line) => (
-                <div key={line.id} className="row" style={{ justifyContent: "space-between" }}>
-                  <span>
-                    {line.qty}× {line.product_name ?? "Item"}
-                  </span>
-                  <span>
-                    ₱{((line.unit_price_centavos * line.qty - Number(line.discount_centavos ?? 0)) / 100).toFixed(2)}
-                  </span>
+                <div key={line.id} className="stack" style={{ gap: 2 }}>
+                  <div className="row" style={{ justifyContent: "space-between" }}>
+                    <span>
+                      {line.qty}× {line.product_name ?? "Item"}
+                    </span>
+                    <span>
+                      ₱{((line.unit_price_centavos * line.qty - Number(line.discount_centavos ?? 0)) / 100).toFixed(2)}
+                    </span>
+                  </div>
+                  {line.line_notes && line.line_notes !== "[FREEBIE]" ? (
+                    <div style={{ fontSize: "0.85em", color: "var(--color-primary)", fontWeight: 600, paddingLeft: "1.5em" }}>
+                      Note: {line.line_notes.replace("[FREEBIE] ", "").replace("[FREEBIE]", "")}
+                    </div>
+                  ) : null}
                 </div>
               ))}
             </div>
-            <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
-              <button type="button" className="ghost-btn" disabled={busy} onClick={() => void setKdsState("preparing")}>
-                Mark preparing
-              </button>
-              <button type="button" className="primary-btn" disabled={busy} onClick={() => void setKdsState("ready")}>
-                Ready to serve
-              </button>
-              <button type="button" className="ghost-btn" disabled={busy} onClick={() => void setKdsState("served")}>
-                Mark served
-              </button>
-            </div>
+            {!isParkedTicket(selectedTicket.ticket) ? (
+              <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
+                {selectedTicket.ticket.kds_state === "ready" ? (
+                  <>
+                    <button type="button" className="ghost-btn" disabled={busy} onClick={() => void setKdsState("preparing")}>
+                      Mark preparing
+                    </button>
+                    <button type="button" className="ghost-btn" disabled={busy} onClick={() => void setKdsState("served")}>
+                      Mark served
+                    </button>
+                  </>
+                ) : (
+                  <button type="button" className="primary-btn" disabled={busy} onClick={() => void setKdsState("ready")}>
+                    Ready to serve
+                  </button>
+                )}
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}

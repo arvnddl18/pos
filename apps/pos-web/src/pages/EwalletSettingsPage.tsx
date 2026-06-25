@@ -1,9 +1,9 @@
 import { type ChangeEvent, FormEvent, useEffect, useState } from "react";
 import { api, API_BASE } from "../api.js";
+import { emitToast } from "../ui/ToastProvider.js";
 
 export function EwalletSettingsPage() {
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
-  const [msg, setMsg] = useState<string | null>(null);
   const [uploadBusy, setUploadBusy] = useState(false);
 
   async function load() {
@@ -29,18 +29,22 @@ export function EwalletSettingsPage() {
     e.preventDefault();
     const fd = new FormData(e.currentTarget);
     const managerAbove = fd.get("managerAbove");
-    await api("/ewallet/settings", {
-      method: "PUT",
-      json: {
-        displayName: String(fd.get("displayName") ?? "") || null,
-        gcashNumber: String(fd.get("gcashNumber") ?? "") || null,
-        instructions: String(fd.get("instructions") ?? "") || null,
-        managerConfirmAboveCentavos:
-          managerAbove === "" ? null : Math.round(Number(String(managerAbove)) * 100),
-        referenceRequired: fd.get("referenceRequired") === "on",
-      },
-    });
-    setMsg("Saved");
+    try {
+      await api("/ewallet/settings", {
+        method: "PUT",
+        json: {
+          displayName: String(fd.get("displayName") ?? "") || null,
+          gcashNumber: String(fd.get("gcashNumber") ?? "") || null,
+          instructions: String(fd.get("instructions") ?? "") || null,
+          managerConfirmAboveCentavos:
+            managerAbove === "" ? null : Math.round(Number(String(managerAbove)) * 100),
+          referenceRequired: fd.get("referenceRequired") === "on",
+        },
+      });
+      emitToast("success", "GCash settings saved");
+    } catch {
+      // API error toast handled by api()
+    }
   }
 
   async function onQrFile(e: ChangeEvent<HTMLInputElement>) {
@@ -48,7 +52,6 @@ export function EwalletSettingsPage() {
     e.target.value = "";
     if (!file || !file.type.startsWith("image/")) return;
     setUploadBusy(true);
-    setMsg(null);
     try {
       const res = await fetch(`${API_BASE}/uploads/ewallet-qr`, {
         method: "POST",
@@ -60,9 +63,9 @@ export function EwalletSettingsPage() {
       if (!res.ok) throw new Error(data.error ?? res.statusText);
       if (!data.key) throw new Error("missing_key");
       await api("/ewallet/settings", { method: "PUT", json: { qrR2Key: data.key } });
-      setMsg("Receive QR updated");
+      emitToast("success", "Receive QR updated");
     } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Upload failed");
+      emitToast("error", err instanceof Error ? err.message : "Upload failed");
     } finally {
       setUploadBusy(false);
     }
@@ -70,12 +73,11 @@ export function EwalletSettingsPage() {
 
   async function clearQr() {
     setUploadBusy(true);
-    setMsg(null);
     try {
       await api("/ewallet/settings", { method: "PUT", json: { qrR2Key: null } });
-      setMsg("Receive QR removed");
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : "Failed");
+      emitToast("success", "Receive QR removed");
+    } catch {
+      // API error toast handled by api()
     } finally {
       setUploadBusy(false);
     }
@@ -136,7 +138,6 @@ export function EwalletSettingsPage() {
           <input type="checkbox" name="referenceRequired" defaultChecked={settings?.reference_required === 1} />
           <span>Require reference note when starting GCash payment</span>
         </label>
-        {msg ? <div className="muted">{msg}</div> : null}
         <button className="primary-btn" type="submit">
           Save
         </button>

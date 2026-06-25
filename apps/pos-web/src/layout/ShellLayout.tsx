@@ -1,6 +1,8 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { api, clearCsrfToken } from "../api.js";
+import { AuthProvider } from "../auth/AuthContext.js";
+import { canAccessPage, isRole, NAV_ITEMS, PAGE_PATHS, type Role } from "@pos/shared";
 
 type Me = { user: { id: string; role: string; displayName: string } };
 
@@ -37,71 +39,74 @@ export function ShellLayout() {
     );
   }
 
-  if (!state.ok) return null;
+  if (!state.ok || !state.me || !isRole(state.me.role)) return null;
+
+  const role = state.me.role as Role;
+  const visibleNavItems = NAV_ITEMS.filter((item) => canAccessPage(role, item.page));
 
   return (
-    <div className={`app-shell${isSidebarCollapsed ? " sidebar-collapsed" : ""}`}>
-      {!isSidebarCollapsed ? (
-      <aside className="nav-rail">
-        <button
-          type="button"
-          className="rail-toggle"
-          aria-label="Collapse sidebar"
-          aria-expanded
-          onClick={() => setIsSidebarCollapsed((prev) => !prev)}
-        >
-          ☰
-        </button>
-        <div className="brand">
-          Coffee
-          <span className="brand-sub">POS EXPERIENCE</span>
-        </div>
-        <nav>
-          <NavLink to="/pos" className={({ isActive }) => (isActive ? "active" : "")}>
-            POS
-          </NavLink>
-          <NavLink to="/admin">Admin</NavLink>
-          <NavLink to="/reports">Reports</NavLink>
-          <NavLink to="/kds">KDS</NavLink>
-          <NavLink to="/ewallet">E-Wallet</NavLink>
-          <NavLink to="/staff">Staff</NavLink>
-          <NavLink to="/inventory">Inventory</NavLink>
-          <NavLink to="/shifts">Shifts</NavLink>
-          <NavLink to="/pricing">Price Rules</NavLink>
-        </nav>
-        <div className="bottom account-area">
-          <button type="button" className="ghost-btn account-btn" onClick={() => setMenuOpen((v) => !v)}>
-            <span className="btn-icon">👤</span>
-            <span>{state.me?.displayName ?? "Account"}</span>
-          </button>
-          {menuOpen ? (
-            <div className="account-menu">
-              <div className="muted" style={{ fontSize: 12 }}>
-                Signed in as {state.me?.role ?? "staff"}
-              </div>
-              <button type="button" className="ghost-btn" onClick={() => void logout()}>
-                <span className="btn-icon">↪</span>
-                <span>Log out</span>
-              </button>
+    <AuthProvider user={{ id: state.me.id, role, displayName: state.me.displayName }}>
+      <div className={`app-shell${isSidebarCollapsed ? " sidebar-collapsed" : ""}`}>
+        {!isSidebarCollapsed ? (
+          <aside className="nav-rail">
+            <button
+              type="button"
+              className="rail-toggle"
+              aria-label="Collapse sidebar"
+              aria-expanded
+              onClick={() => setIsSidebarCollapsed((prev) => !prev)}
+            >
+              ☰
+            </button>
+            <div className="brand">
+              Coffee
+              <span className="brand-sub">POS EXPERIENCE</span>
             </div>
-          ) : null}
-        </div>
-      </aside>
-      ) : null}
-      <main className="main-area">
-        {isSidebarCollapsed ? (
-          <button
-            type="button"
-            className="rail-toggle rail-toggle-main"
-            aria-label="Expand sidebar"
-            aria-expanded={false}
-            onClick={() => setIsSidebarCollapsed(false)}
-          >
-            ☰
-          </button>
+            <nav>
+              {visibleNavItems.map((item) => (
+                <NavLink
+                  key={item.page}
+                  to={PAGE_PATHS[item.page]}
+                  className={({ isActive }) => (isActive ? "active" : "")}
+                >
+                  {item.label}
+                </NavLink>
+              ))}
+            </nav>
+            <div className="bottom account-area">
+              <button type="button" className="ghost-btn account-btn" onClick={() => setMenuOpen((v) => !v)}>
+                <span className="btn-icon">👤</span>
+                <span>{state.me.displayName ?? "Account"}</span>
+              </button>
+              {menuOpen ? (
+                <div className="account-menu">
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    Signed in as {role}
+                  </div>
+                  <button type="button" className="ghost-btn" onClick={() => void logout()}>
+                    <span className="btn-icon">↪</span>
+                    <span>Log out</span>
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          </aside>
         ) : null}
-        <Outlet />
-      </main>
-    </div>
+        <main className="main-area">
+          {isSidebarCollapsed ? (
+            <button
+              type="button"
+              className="rail-toggle rail-toggle-main"
+              aria-label="Expand sidebar"
+              aria-expanded={false}
+              onClick={() => setIsSidebarCollapsed(false)}
+            >
+              ☰
+            </button>
+          ) : null}
+          <Outlet />
+        </main>
+      </div>
+    </AuthProvider>
   );
 }

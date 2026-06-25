@@ -1,43 +1,9 @@
 import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { api, API_BASE, formatPhp } from "../api.js";
+import { emitToast } from "../ui/ToastProvider.js";
+import { useInputDialogs } from "../ui/useInputDialogs.js";
+import { ManagerPinCancelledError, useManagerPinConfirm } from "../ui/useManagerPinConfirm.js";
 
-type EwalletUi = {
-  display_name?: string | null;
-  gcash_number?: string | null;
-  qr_r2_key?: string | null;
-  instructions?: string | null;
-} | null;
-
-function GcashCustomerPanel({ ew }: { ew: EwalletUi }) {
-  if (!ew || (!ew.display_name && !ew.gcash_number && !ew.qr_r2_key && !ew.instructions)) {
-    return (
-      <div className="muted" style={{ fontSize: 13 }}>
-        Set GCash number, receive QR, and instructions under <strong>GCash</strong> in the nav.
-      </div>
-    );
-  }
-  return (
-    <div className="stack" style={{ gap: 8, padding: 12, borderRadius: 8, border: "1px solid #2a2a2a", background: "#141414" }}>
-      <div className="label">Show customer</div>
-      {ew.display_name ? <div style={{ fontWeight: 600 }}>{String(ew.display_name)}</div> : null}
-      {ew.gcash_number ? (
-        <div style={{ fontSize: 18, fontVariantNumeric: "tabular-nums", letterSpacing: "0.02em" }}>{String(ew.gcash_number)}</div>
-      ) : null}
-      {ew.qr_r2_key ? (
-        <img
-          alt="GCash receive QR"
-          src={resolveAssetImageSrc(String(ew.qr_r2_key))}
-          style={{ maxWidth: 220, alignSelf: "start", borderRadius: 6 }}
-        />
-      ) : null}
-      {ew.instructions ? (
-        <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 12, fontFamily: "inherit", color: "#ccc" }}>
-          {String(ew.instructions)}
-        </pre>
-      ) : null}
-    </div>
-  );
-}
 
 type Register = { id: string; name: string };
 type Product = {
@@ -101,7 +67,41 @@ type ParkedTicketRow = {
   line_count?: number;
   item_qty?: number;
   due_centavos?: number;
+  paid_centavos?: number;
+  pending_payment_count?: number;
 };
+
+type TicketAutoParkGuard = {
+  ticket?: { status?: string };
+  lineItems?: { voided?: number | boolean; qty?: number }[];
+  payments?: { status?: string; amount_centavos?: number }[];
+  totals?: { remainingDueCentavos?: number; dueCentavos?: number };
+};
+
+function ticketIsSettled(detail: TicketAutoParkGuard): boolean {
+  const status = detail.ticket?.status;
+  if (status === "paid" || status === "voided") return true;
+  const hasItems = detail.lineItems?.some((li) => !li.voided && Number(li.qty ?? 0) > 0);
+  if (!hasItems) return true;
+  if (detail.payments?.some((p) => p.status === "pending_ewallet")) return true;
+  const remainingDue = detail.totals?.remainingDueCentavos;
+  if (remainingDue !== undefined && remainingDue <= 0) return true;
+  const completedPaid = (detail.payments ?? [])
+    .filter((p) => p.status === "completed")
+    .reduce((sum, p) => sum + Number(p.amount_centavos ?? 0), 0);
+  const due = Number(detail.totals?.dueCentavos ?? 0);
+  if (due > 0 && completedPaid >= due) return true;
+  return false;
+}
+
+function openTicketRowIsSettled(t: ParkedTicketRow): boolean {
+  if (Number(t.item_qty ?? 0) === 0) return true;
+  if (Number(t.pending_payment_count ?? 0) > 0) return true;
+  const due = Number(t.due_centavos ?? 0);
+  const paid = Number(t.paid_centavos ?? 0);
+  if (paid > 0 && (due === 0 || paid >= due)) return true;
+  return false;
+}
 
 type PaidTicketRow = {
   id: string;
@@ -127,14 +127,14 @@ function formatParkedWhen(iso: string | undefined): string {
 }
 
 const RELOAD_PARK_LABEL = "parked";
+const IDLE_PARK_LABEL = "idle-auto-park";
+const IDLE_PARK_MS = 3 * 60 * 1000; // 3 minutes
 
 function activeTicketStorageKey(registerId: string) {
   return `posActiveTicketId:${registerId}`;
 }
 
-function isManager(role: string) {
-  return role === "manager" || role === "owner";
-}
+const DEFAULT_DEMOGRAPHIC = "green";
 
 function resolveAssetImageSrc(key: string) {
   const trimmed = key.trim();
@@ -155,15 +155,15 @@ export function PosPage() {
   const [lines, setLines] = useState<LineItem[]>([]);
   const [payments, setPayments] = useState<PaymentRow[]>([]);
   const [ticketStatus, setTicketStatus] = useState("");
+  const [ticketNotes, setTicketNotes] = useState<string | null>(null);
   const [selectedTicketType, setSelectedTicketType] = useState<"takeout" | "dine_in" | null>(null);
   const [totals, setTotals] = useState<Totals | null>(null);
   const [busy, setBusy] = useState(false);
   const [payOpen, setPayOpen] = useState(false);
-  const [payTab, setPayTab] = useState<"cash" | "gcash">("cash");
+  const [payTab, setPayTab] = useState<"cash" | "gcash" | "bank_transfer">("cash");
   const [cashReceiptModal, setCashReceiptModal] = useState(false);
   const [cashReceiptDetail, setCashReceiptDetail] = useState<any | null>(null);
   const [cashReceiptLoading, setCashReceiptLoading] = useState(false);
-  const [cashReceiptError, setCashReceiptError] = useState<string | null>(null);
   const [parkedTickets, setParkedTickets] = useState<ParkedTicketRow[]>([]);
   const [parkModalOpen, setParkModalOpen] = useState(false);
   const [parkLabel, setParkLabel] = useState("");
@@ -178,17 +178,33 @@ export function PosPage() {
   const [me, setMe] = useState<{ role: string } | null>(null);
   const [modifierFlow, setModifierFlow] = useState<{ product: Product; detail: PosDetail } | null>(null);
   const [selectedMods, setSelectedMods] = useState<Record<string, string[]>>({});
-  const [ewalletUi, setEwalletUi] = useState<EwalletUi>(null);
   const [bootLoading, setBootLoading] = useState(true);
-  const setNotice = (_value: string | null) => {};
-  const [error, setError] = useState<string | null>(null);
+  const [marketingFreebieOpen, setMarketingFreebieOpen] = useState(false);
+  const { prompt, inputDialogs } = useInputDialogs();
+  const { confirmManagerPin, managerPinModal } = useManagerPinConfirm();
+  const setNotice = (value: string | null) => {
+    if (value) emitToast("success", value);
+  };
   const [imageLoadErrors, setImageLoadErrors] = useState<Record<string, true>>({});
   const deferredSearch = useDeferredValue(search);
   const [activeCategoryId, setActiveCategoryId] = useState("all");
   const isAddingProductRef = useRef(false);
+  const lastActivityRef = useRef<number>(Date.now());
+  // Always-current ref for ticketId so setInterval closures never go stale
+  const ticketIdRef = useRef<string | null>(null);
+  ticketIdRef.current = ticketId;
 
-  const [demographicColor, setDemographicColor] = useState<string | null>(null);
-  const [demographicExpanded, setDemographicExpanded] = useState(true);
+  // Reset idle timer on any user interaction (click, touch, or keypress)
+  useEffect(() => {
+    const resetActivity = () => { lastActivityRef.current = Date.now(); };
+    document.addEventListener("pointerdown", resetActivity, { passive: true });
+    document.addEventListener("keydown", resetActivity, { passive: true });
+    return () => {
+      document.removeEventListener("pointerdown", resetActivity);
+      document.removeEventListener("keydown", resetActivity);
+    };
+  }, []);
+
   const posDetailCache = useRef<Record<string, PosDetail>>({});
   const lastRequestSeq = useRef(0);
 
@@ -291,19 +307,21 @@ export function PosPage() {
   const updateTicketState = useCallback((res: {
     lineItems: LineItem[];
     payments: PaymentRow[];
-    ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null; customer_id?: string | null; feedback_rating?: number | null; feedback_notes?: string | null };
+    ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null; customer_id?: string | null; feedback_rating?: number | null; feedback_notes?: string | null; notes?: string | null };
     totals: Totals;
   }) => {
     setLines((res.lineItems ?? []).filter((l) => !l.voided));
     setPayments(res.payments ?? []);
     setTicketStatus(res.ticket.status);
+    setTicketNotes(res.ticket.notes ?? null);
     setSelectedTicketType(res.ticket.ticket_type === "dine_in" ? "dine_in" : res.ticket.ticket_type === "takeout" ? "takeout" : null);
     setTicketNumber(Number(res.ticket.ticket_no ?? 0) || null);
     setTotals(res.totals ?? null);
-    setDemographicColor(res.ticket.demographic_color ?? null);
-    if (res.ticket.status === "paid") {
-      publishAnalyticsUpdate();
-      publishKdsUpdate("ticket_paid");
+    if (res.ticket.status === "paid" || res.ticket.status === "voided") {
+      if (res.ticket.status === "paid") {
+        publishAnalyticsUpdate();
+        publishKdsUpdate("ticket_paid");
+      }
       if (registerId) sessionStorage.removeItem(activeTicketStorageKey(registerId));
       setTicketId(null);
       setTicketNumber(null);
@@ -311,8 +329,8 @@ export function PosPage() {
       setLines([]);
       setPayments([]);
       setTicketStatus("");
+      setTicketNotes(null);
       setTotals(null);
-      setDemographicColor(null);
     }
   }, [registerId]);
 
@@ -320,7 +338,7 @@ export function PosPage() {
     const res = await api<{
       lineItems: LineItem[];
       payments: PaymentRow[];
-      ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null; customer_id?: string | null; feedback_rating?: number | null; feedback_notes?: string | null; parked_label?: string | null };
+      ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null; customer_id?: string | null; feedback_rating?: number | null; feedback_notes?: string | null; parked_label?: string | null; notes?: string | null };
       totals: Totals;
     }>(`/tickets/${id}`);
     updateTicketState(res);
@@ -340,32 +358,53 @@ export function PosPage() {
   }, [registerId]);
 
   useEffect(() => {
-    if (!ticketId) {
-      setDemographicExpanded(true);
-      return;
-    }
-    if (demographicColor) setDemographicExpanded(false);
-  }, [ticketId, demographicColor]);
+    if (!ticketId || ticketStatus === "paid" || ticketStatus === "voided") return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await api<{
+          lineItems: LineItem[];
+          payments: PaymentRow[];
+          ticket: { status: string; demographic_color?: string | null };
+          totals: Totals;
+        }>(`/tickets/${ticketId}`);
+        if (cancelled || res.ticket.demographic_color === DEFAULT_DEMOGRAPHIC) return;
+        const patched = await api<{
+          lineItems: LineItem[];
+          payments: PaymentRow[];
+          ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null };
+          totals: Totals;
+        }>(`/tickets/${ticketId}/meta`, {
+          method: "PATCH",
+          json: { demographicColor: DEFAULT_DEMOGRAPHIC },
+        });
+        if (!cancelled) updateTicketState(patched);
+      } catch {
+        /* keep local default */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [ticketId, ticketStatus, updateTicketState]);
 
   useEffect(() => {
     let mounted = true;
     async function bootstrap() {
       setBootLoading(true);
-      const [reg, prod, cat, user, ew] = await Promise.allSettled([
+      const [reg, prod, cat, user] = await Promise.allSettled([
         api<{ registers: Register[] }>("/registers"),
         api<{ products: Product[] }>("/catalog/products"),
         api<{ categories: Category[] }>("/catalog/categories"),
         api<{ user: { role: string } }>("/auth/me"),
-        api<{ settings: Record<string, unknown> | null }>("/ewallet/settings"),
       ]);
       if (!mounted) return;
       if (reg.status === "fulfilled") setRegisters(reg.value.registers ?? []);
       if (prod.status === "fulfilled") setProducts((prod.value.products ?? []).filter((p) => p.is_active !== 0));
       if (cat.status === "fulfilled") setCategories(cat.value.categories ?? []);
       if (user.status === "fulfilled") setMe({ role: user.value.user.role });
-      if (ew.status === "fulfilled") setEwalletUi((ew.value.settings as EwalletUi) ?? null);
       if ([reg, prod, cat, user].some((r) => r.status === "rejected")) {
-        setError("Some POS data failed to load. Retry or refresh.");
+        emitToast("error", "Some POS data failed to load. Retry or refresh.");
       }
       setBootLoading(false);
     }
@@ -407,12 +446,6 @@ export function PosPage() {
     };
   }, [products]);
 
-  useEffect(() => {
-    if (!payOpen) return;
-    void api<{ settings: Record<string, unknown> | null }>("/ewallet/settings").then((r) =>
-      setEwalletUi((r.settings as EwalletUi) ?? null),
-    );
-  }, [payOpen]);
 
   useEffect(() => {
     if (!payOpen || !totals) return;
@@ -439,12 +472,25 @@ export function PosPage() {
     let cancelled = false;
     async function autoParkTicketAfterReload() {
       const storedId = sessionStorage.getItem(activeTicketStorageKey(registerId));
-      if (!storedId) return;
+      if (!storedId) {
+        // No prior ticket to park — just load parked tickets and auto-resume empty one
+        if (!cancelled) {
+          const loaded = await loadParkedTickets().catch(() => {});
+          void loaded;
+          // Auto-resume will happen via the separate startup-resume effect
+        }
+        return;
+      }
       sessionStorage.removeItem(activeTicketStorageKey(registerId));
       try {
-        const res = await api<{ ticket: { status: string } }>(`/tickets/${storedId}`);
+        const res = await api<{
+          ticket: { status: string };
+          lineItems?: LineItem[];
+          payments?: PaymentRow[];
+          totals?: Totals;
+        }>(`/tickets/${storedId}`);
         if (cancelled) return;
-        if (res.ticket?.status === "open") {
+        if (res.ticket?.status === "open" && !ticketIsSettled(res)) {
           await api(`/tickets/${storedId}/park`, {
             method: "PATCH",
             json: { parkedLabel: RELOAD_PARK_LABEL },
@@ -465,6 +511,140 @@ export function PosPage() {
       cancelled = true;
     };
   }, [registerId, bootLoading, loadParkedTickets]);
+
+  // Auto-park idle open tickets after 3 minutes.
+  // Strategy A: if there's a session-active ticket and the cashier has been idle, park it.
+  // Strategy B: every 30 s, scan ALL open tickets on this register from the server and park
+  //             any whose updated_at is older than IDLE_PARK_MS. This catches tickets that
+  //             exist in the DB but are not the current session ticket (e.g., opened in another
+  //             tab, or the page was reloaded and the ticket was lost from session state).
+  useEffect(() => {
+    if (!registerId) return;
+
+    const checkIdle = async () => {
+      const now = Date.now();
+
+      // --- Strategy A: session-active ticket + local idle timer ---
+      const currentTicketId = ticketIdRef.current;
+      if (currentTicketId && now - lastActivityRef.current >= IDLE_PARK_MS) {
+        try {
+          const res = await api<{
+            ticket: { status: string };
+            lineItems?: LineItem[];
+            payments?: PaymentRow[];
+            totals?: Totals;
+          }>(`/tickets/${currentTicketId}`);
+          if (res.ticket?.status === "open") {
+            if (ticketIsSettled(res)) {
+              if (ticketIdRef.current === currentTicketId) {
+                clearActiveTicket();
+              }
+              return;
+            }
+            await api(`/tickets/${currentTicketId}/park`, {
+              method: "PATCH",
+              json: { parkedLabel: IDLE_PARK_LABEL },
+            });
+            publishKdsUpdate("ticket_parked_idle");
+            emitToast("success", "Ticket parked due to 3 minutes of inactivity.");
+            clearActiveTicket();
+            await loadParkedTickets();
+            lastActivityRef.current = Date.now();
+            return; // Don't also run Strategy B in the same tick
+          } else if (ticketIdRef.current === currentTicketId) {
+            clearActiveTicket();
+          }
+        } catch {
+          /* ignore transient errors */
+        }
+      }
+
+      // --- Strategy B: server-side sweep of ALL open tickets on this register ---
+      try {
+        const res = await api<{ tickets: ParkedTicketRow[] }>(
+          `/tickets/open?registerId=${encodeURIComponent(registerId)}&status=open`
+        );
+        const openTickets = res.tickets ?? [];
+        for (const t of openTickets) {
+          if (!t.updated_at) continue;
+          const age = now - new Date(t.updated_at).getTime();
+          if (age < IDLE_PARK_MS) continue;
+          if (openTicketRowIsSettled(t)) continue;
+
+          // This ticket has been idle on the server — park it
+          try {
+            await api(`/tickets/${t.id}/park`, {
+              method: "PATCH",
+              json: { parkedLabel: IDLE_PARK_LABEL },
+            });
+            publishKdsUpdate("ticket_parked_idle");
+            emitToast("success", `Ticket ${t.ticket_no ? `#${String(t.ticket_no).padStart(4, "0")}` : ""} parked due to 3 minutes of inactivity.`);
+            // If this was our session ticket, clear it
+            if (ticketIdRef.current === t.id) {
+              clearActiveTicket();
+              lastActivityRef.current = Date.now();
+            }
+          } catch {
+            /* ticket may have already been parked/paid by another session */
+          }
+        }
+        if (openTickets.some((t) => {
+          const age = now - new Date(t.updated_at ?? 0).getTime();
+          return age >= IDLE_PARK_MS;
+        })) {
+          await loadParkedTickets();
+        }
+      } catch {
+        /* ignore network errors */
+      }
+    };
+
+    // Run immediately on mount so already-overdue tickets are caught right away
+    void checkIdle();
+    // Then check every 15 seconds
+    const intervalId = window.setInterval(() => void checkIdle(), 15_000);
+    return () => window.clearInterval(intervalId);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [registerId]);
+
+  // On startup: auto-resume the oldest unprocessed (no items, no cash) parked ticket
+  const startupResumedRef = useRef(false);
+  useEffect(() => {
+    if (bootLoading || !registerId || ticketId || startupResumedRef.current) return;
+    if (parkedTickets.length === 0) return;
+    const candidates = parkedTickets.filter(
+      (t) => Number(t.item_qty ?? 0) === 0 && Number(t.due_centavos ?? 0) === 0
+    );
+    if (candidates.length === 0) return;
+    const sorted = [...candidates].sort((a, b) => {
+      const da = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+      const db = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+      return da - db;
+    });
+    const target = sorted[0];
+    if (!target) return;
+    startupResumedRef.current = true;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await api<{
+          lineItems: LineItem[];
+          payments: PaymentRow[];
+          ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null };
+          totals: Totals;
+        }>(`/tickets/${target.id}/resume`, { method: "PATCH", json: {} });
+        if (cancelled) return;
+        setTicketId(target.id);
+        updateTicketState(res);
+        publishKdsUpdate("ticket_resumed");
+        await loadParkedTickets();
+      } catch {
+        if (!cancelled) startupResumedRef.current = false;
+      }
+    })();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bootLoading, registerId, ticketId, parkedTickets]);
 
   useEffect(() => {
     if (!registerId) return;
@@ -514,6 +694,10 @@ export function PosPage() {
     setSelectedTicketType(ticketTypeForCreate);
     setTicketStatus("open");
     sessionStorage.setItem(activeTicketStorageKey(registerId), created.id);
+    void api(`/tickets/${created.id}/meta`, {
+      method: "PATCH",
+      json: { demographicColor: DEFAULT_DEMOGRAPHIC },
+    }).catch(() => {});
     return created.id;
   }
 
@@ -526,10 +710,9 @@ export function PosPage() {
       if (seq === lastRequestSeq.current) {
         updateTicketState(res);
       }
-    } catch (err) {
+    } catch {
       if (seq === lastRequestSeq.current) {
         refreshTicket(ticketId);
-        setError("Failed to update ticket type.");
       }
     }
   }
@@ -583,7 +766,7 @@ export function PosPage() {
         updateTicketState(res);
       }
       publishKdsUpdate("line_added");
-    } catch (err) {
+    } catch {
       if (seq === lastRequestSeq.current) {
         if (ticketId) {
           refreshTicket(ticketId);
@@ -591,7 +774,6 @@ export function PosPage() {
           setLines([]);
           setTotals(null);
         }
-        setError("Failed to add product to ticket.");
       }
     }
   }
@@ -600,7 +782,7 @@ export function PosPage() {
     if (isAddingProductRef.current) return;
     if (p.out_of_stock === 1) return;
     if (!registerId) {
-      setError("Select a register first before adding items.");
+      emitToast("error", "Select a register first before adding items.");
       return;
     }
 
@@ -629,12 +811,11 @@ export function PosPage() {
         } else {
           await addLine(p.id, 1, []);
         }
-        setError(null);
         setNotice(`${p.name} added`);
         return;
       }
       if (!detail) {
-        setError(`Failed to load modifiers for ${p.name}.`);
+        emitToast("error", `Failed to load modifiers for ${p.name}.`);
         return;
       }
 
@@ -654,12 +835,11 @@ export function PosPage() {
       }
       setSelectedMods(init);
       setModifierFlow({ product: p, detail });
-      setError(null);
     } catch (err) {
-      if (err instanceof Error && err.message) {
-        setError(err.message);
-      } else {
-        setError(`Failed to add ${p.name}. Please try again.`);
+      if (err instanceof Error && err.message && !(err as Error & { status?: number }).status) {
+        emitToast("error", err.message);
+      } else if (!(err instanceof Error && (err as Error & { status?: number }).status)) {
+        emitToast("error", `Failed to add ${p.name}. Please try again.`);
       }
     } finally {
       isAddingProductRef.current = false;
@@ -720,12 +900,11 @@ export function PosPage() {
 
   function openParkModal() {
     if (!ticketId || lines.length === 0) {
-      setError("Add at least one item before parking a ticket.");
+      emitToast("error", "Add at least one item before parking a ticket.");
       return;
     }
     setParkLabel("");
     setParkModalOpen(true);
-    setError(null);
   }
 
   async function confirmParkTicket(e: FormEvent<HTMLFormElement>) {
@@ -733,11 +912,10 @@ export function PosPage() {
     if (!ticketId) return;
     const label = parkLabel.trim();
     if (!label) {
-      setError("Enter a customer name or identifier.");
+      emitToast("error", "Enter a customer name or identifier.");
       return;
     }
     setParkBusy(true);
-    setError(null);
     try {
       await api(`/tickets/${ticketId}/park`, { method: "PATCH", json: { parkedLabel: label } });
       publishKdsUpdate("ticket_parked");
@@ -745,8 +923,8 @@ export function PosPage() {
       setParkLabel("");
       clearActiveTicket();
       await loadParkedTickets();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to park ticket.");
+    } catch {
+      // API error toast handled by api()
     } finally {
       setParkBusy(false);
     }
@@ -760,18 +938,43 @@ export function PosPage() {
     setLines([]);
     setPayments([]);
     setTicketStatus("");
+    setTicketNotes(null);
     setTotals(null);
-    setDemographicColor(null);
-    setDemographicExpanded(true);
+  }
+
+  async function editTicketNote() {
+    if (!ticketId) return;
+    const notesInput = await prompt({
+      title: "Add Note / Customer Name",
+      message: "Enter a note or customer name for this order.",
+      defaultValue: ticketNotes || "",
+      placeholder: "Customer name or note",
+      confirmLabel: "Save",
+    });
+    if (notesInput === null) return;
+    
+    const seq = ++lastRequestSeq.current;
+    try {
+      const res = await api<any>(`/tickets/${ticketId}/meta`, {
+        method: "PATCH",
+        json: { notes: notesInput || undefined },
+      });
+      if (seq === lastRequestSeq.current) {
+        updateTicketState(res);
+        setNotice("Ticket note updated");
+        publishKdsUpdate("ticket_note_updated");
+      }
+    } catch {
+      if (seq === lastRequestSeq.current) refreshTicket(ticketId);
+    }
   }
 
   async function resumeParkedTicket(row: ParkedTicketRow) {
     if (ticketId && ticketStatus === "open" && lines.length > 0 && ticketId !== row.id) {
-      setError("Park or complete the current ticket before opening a parked order.");
+      emitToast("error", "Park or complete the current ticket before opening a parked order.");
       return;
     }
     setBusy(true);
-    setError(null);
     try {
       const res = await api<{
         lineItems: LineItem[];
@@ -784,8 +987,8 @@ export function PosPage() {
       publishKdsUpdate("ticket_resumed");
       setParkModalOpen(false);
       await loadParkedTickets();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to resume parked ticket.");
+    } catch {
+      // API error toast handled by api()
     } finally {
       setBusy(false);
     }
@@ -795,12 +998,58 @@ export function PosPage() {
     openParkModal();
   }
 
-  function newTicket() {
+  // Returns the oldest parked ticket that has no items selected and no cash recorded (unprocessed/empty)
+  function findEmptyParkedTicket(): ParkedTicketRow | null {
+    const candidates = parkedTickets.filter(
+      (t) => (Number(t.item_qty ?? 0) === 0) && (Number(t.due_centavos ?? 0) === 0)
+    );
+    if (candidates.length === 0) return null;
+    // Sort ascending by updated_at so we get the oldest one first
+    const sorted = [...candidates].sort((a, b) => {
+      const da = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+      const db = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+      return da - db;
+    });
+    return sorted[0] ?? null;
+  }
+
+  async function newTicket() {
+    // If there's a current ticket with items open, just clear (user explicitly wants new)
+    if (ticketId && lines.length > 0) {
+      clearActiveTicket();
+      setNotice("Ready for new ticket");
+      return;
+    }
+    // Try to resume an existing unprocessed parked ticket
+    const emptyParked = findEmptyParkedTicket();
+    if (emptyParked) {
+      setBusy(true);
+      try {
+        const res = await api<{
+          lineItems: LineItem[];
+          payments: PaymentRow[];
+          ticket: { status: string; ticket_no?: number | null; ticket_type?: string | null; demographic_color?: string | null };
+          totals: Totals;
+        }>(`/tickets/${emptyParked.id}/resume`, { method: "PATCH", json: {} });
+        setTicketId(emptyParked.id);
+        updateTicketState(res);
+        publishKdsUpdate("ticket_resumed");
+        await loadParkedTickets();
+        setNotice(`Resumed unprocessed ticket ${formatTicketLabel(emptyParked.id, Number(emptyParked.ticket_no ?? 0) || null)}`);
+      } catch {
+        // If resume fails, just clear and start fresh
+        clearActiveTicket();
+        setNotice("Ready for new ticket");
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     clearActiveTicket();
     setNotice("Ready for new ticket");
   }
 
-  async function payCash(e: FormEvent<HTMLFormElement>) {
+  async function payRecord(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!ticketId || !totals) return;
     const paidTicketId = ticketId;
@@ -809,34 +1058,33 @@ export function PosPage() {
     const rounding = Number(String(fd.get("roundingCentavos") ?? "0")) || 0;
     const centavos = Math.round(pesos * 100);
     if (centavos < totals.remainingDueCentavos) {
-      setError(`Insufficient cash. Need at least ${formatPhp(totals.remainingDueCentavos)} to complete this payment.`);
+      emitToast("warning", `Insufficient amount. Need at least ${formatPhp(totals.remainingDueCentavos)} to complete this payment.`);
       return;
     }
     const key = crypto.randomUUID();
     const seq = ++lastRequestSeq.current;
     try {
+      const tenderType = payTab === "cash" ? "cash" : (payTab === "gcash" ? "e_wallet_personal" : "e_wallet_merchant");
       const res = await api<any>(`/tickets/${ticketId}/payments`, {
         method: "POST",
         headers: { "Idempotency-Key": key },
-        json: { tenderType: "cash", amountCentavos: centavos, roundingCentavos: rounding },
+        json: { tenderType, amountCentavos: centavos, roundingCentavos: rounding },
       });
       if (seq === lastRequestSeq.current) {
         updateTicketState(res);
         setPayOpen(false);
         void openCashReceiptDetail(paidTicketId);
-        setNotice("Cash payment recorded");
+        setNotice("Payment recorded");
       }
-    } catch (err) {
+    } catch {
       if (seq === lastRequestSeq.current) {
         refreshTicket(ticketId);
-        setError("Failed to record cash payment.");
       }
     }
   }
   async function openCashReceiptDetail(ticketIdToOpen: string) {
     setCashReceiptModal(true);
     setCashReceiptLoading(true);
-    setCashReceiptError(null);
     setCashReceiptDetail(null);
     try {
       const detail = await api<{
@@ -844,72 +1092,30 @@ export function PosPage() {
         textReceipt: string;
       }>(`/tickets/${ticketIdToOpen}/receipt`);
       setCashReceiptDetail(detail);
-    } catch (err: any) {
-      setCashReceiptError(err?.message ?? "Failed to load ticket receipt");
+    } catch {
+      setCashReceiptModal(false);
+      // API error toast handled by api()
     } finally {
       setCashReceiptLoading(false);
     }
   }
 
-  async function payGcashStart(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (!ticketId) return;
-    const fd = new FormData(e.currentTarget);
-    const pesos = Number(String(fd.get("pesos") ?? "0"));
-    const ref = String(fd.get("ref") ?? "").trim();
-    const rounding = Number(String(fd.get("roundingCentavos") ?? "0")) || 0;
-    const centavos = Math.round(pesos * 100);
-    const key = crypto.randomUUID();
-    const seq = ++lastRequestSeq.current;
-    try {
-      const res = await api<any>(`/tickets/${ticketId}/payments`, {
-        method: "POST",
-        headers: { "Idempotency-Key": key },
-        json: {
-          tenderType: "e_wallet_personal",
-          amountCentavos: centavos,
-          referenceNote: ref || undefined,
-          roundingCentavos: rounding,
-        },
-      });
-      if (seq === lastRequestSeq.current) {
-        updateTicketState(res);
-        setNotice("GCash pending payment started");
-      }
-    } catch (err) {
-      if (seq === lastRequestSeq.current) {
-        refreshTicket(ticketId);
-        setError("Failed to start GCash payment.");
-      }
-    }
-  }
-
-  async function confirmPayment(pid: string) {
-    const seq = ++lastRequestSeq.current;
-    try {
-      const res = await api<any>(`/payments/${pid}/confirm-ewallet`, { method: "POST", json: {} });
-      if (seq === lastRequestSeq.current) {
-        updateTicketState(res);
-        setPayOpen(false);
-        setNotice("GCash payment confirmed");
-      }
-    } catch (err) {
-      if (seq === lastRequestSeq.current) {
-        if (ticketId) refreshTicket(ticketId);
-        setError("Failed to confirm GCash payment.");
-      }
-    }
-  }
-
-  async function closeMarketingFreebieTicket() {
+  async function closeMarketingFreebieTicket(e?: FormEvent<HTMLFormElement>) {
+    if (e) e.preventDefault();
     if (!ticketId || !totals) return;
     if (totals.remainingDueCentavos > 0) {
-      setError("Ticket still has remaining due. Complete payment first.");
+      emitToast("error", "Ticket still has remaining due. Complete payment first.");
       return;
     }
-    const influencerName = (window.prompt("Influencer name (optional):") ?? "").trim();
-    const campaign = (window.prompt("Campaign name (optional):") ?? "").trim();
-    const note = (window.prompt("Marketing note (optional):") ?? "").trim();
+    let influencerName = "";
+    let campaign = "";
+    let note = "";
+    if (e?.currentTarget) {
+      const fd = new FormData(e.currentTarget);
+      influencerName = String(fd.get("influencerName") ?? "").trim();
+      campaign = String(fd.get("campaign") ?? "").trim();
+      note = String(fd.get("note") ?? "").trim();
+    }
     const seq = ++lastRequestSeq.current;
     try {
       const res = await api<any>(`/tickets/${ticketId}/close-freebie`, {
@@ -923,34 +1129,65 @@ export function PosPage() {
       if (seq === lastRequestSeq.current) {
         updateTicketState(res);
         setPayOpen(false);
+        setMarketingFreebieOpen(false);
         void openCashReceiptDetail(ticketId);
         setNotice("Ticket submitted as marketing freebie");
       }
-    } catch (err) {
+    } catch {
       if (seq === lastRequestSeq.current) {
         refreshTicket(ticketId);
-        setError("Failed to submit freebie ticket.");
       }
     }
   }
 
-  async function voidLine(li: LineItem) {
-    const reason = window.prompt("Void reason (manager only)?");
-    if (!reason) return;
+  function openMarketingFreebieModal() {
+    if (!ticketId || !totals) return;
+    if (totals.remainingDueCentavos > 0) {
+      emitToast("error", "Ticket still has remaining due. Complete payment first.");
+      return;
+    }
+    setMarketingFreebieOpen(true);
+  }
+
+  async function editLineNote(li: LineItem) {
     if (!ticketId) return;
+    const isFreebie = li.discount_centavos != null && li.discount_centavos >= (li.unit_price_centavos * li.qty);
+    const currentNotes = String(li.line_notes ?? "").trim();
+    let strippedNotes = currentNotes;
+    if (currentNotes.startsWith("[FREEBIE] ")) {
+       strippedNotes = currentNotes.replace("[FREEBIE] ", "").trim();
+    } else if (currentNotes === "[FREEBIE]") {
+       strippedNotes = "";
+    }
+
+    const notesInput = await prompt({
+      title: `Add Note for ${li.product_name ?? "Item"}`,
+      message: "Enter modifiers or special requests.",
+      defaultValue: strippedNotes,
+      placeholder: "e.g. Add more sugar, Oat Milk only",
+      confirmLabel: "Save",
+    });
+    if (notesInput === null) return;
+    
+    const newNotes = notesInput.trim();
+    let finalNotes = newNotes;
+    if (isFreebie) {
+      finalNotes = newNotes ? `[FREEBIE] ${newNotes}` : "[FREEBIE]";
+    }
+
     const seq = ++lastRequestSeq.current;
     try {
-      const res = await api<any>(`/tickets/${ticketId}/lines/${li.id}/void`, { method: "POST", json: { reason } });
-        if (seq === lastRequestSeq.current) {
-          updateTicketState(res);
-          publishKdsUpdate("line_voided");
-          setNotice("Line voided");
-        }
-    } catch (err) {
+      const res = await api<any>(`/tickets/${ticketId}/lines/${li.id}`, {
+        method: "PATCH",
+        json: { lineNotes: finalNotes || null },
+      });
       if (seq === lastRequestSeq.current) {
-        refreshTicket(ticketId);
-        setError("Failed to void line.");
+        updateTicketState(res);
+        publishKdsUpdate("line_updated");
+        setNotice("Line note updated");
       }
+    } catch {
+      if (seq === lastRequestSeq.current) refreshTicket(ticketId);
     }
   }
 
@@ -988,10 +1225,9 @@ export function PosPage() {
           setNotice(`${lineItem.product_name ?? "Item"} updated`);
         }
       }
-    } catch (err) {
+    } catch {
       if (seq === lastRequestSeq.current) {
         refreshTicket(ticketId);
-        setError("Failed to update quantity. Reverting changes.");
       }
     }
   }
@@ -1007,7 +1243,15 @@ export function PosPage() {
     let discountCentavos = 0;
 
     if (nextFreebie) {
-      const reasonInput = window.prompt("Freebie reason (optional):", strippedNotes) ?? "";
+      const reasonInput = await prompt({
+        title: "Mark as freebie",
+        message: "Optional reason for this freebie.",
+        defaultValue: strippedNotes,
+        placeholder: "Freebie reason (optional)",
+        required: false,
+        confirmLabel: "Apply freebie",
+      });
+      if (reasonInput === null) return;
       const reason = reasonInput.trim();
       lineNotes = reason ? `[FREEBIE] ${reason}` : "[FREEBIE]";
       discountCentavos = fullLinePrice;
@@ -1024,10 +1268,9 @@ export function PosPage() {
         publishKdsUpdate("line_updated");
         setNotice(nextFreebie ? `${lineItem.product_name ?? "Item"} marked as freebie` : `${lineItem.product_name ?? "Item"} freebie removed`);
       }
-    } catch (err) {
+    } catch {
       if (seq === lastRequestSeq.current) {
         refreshTicket(ticketId);
-        setError("Failed to update freebie status.");
       }
     }
   }
@@ -1045,7 +1288,6 @@ export function PosPage() {
     setRefundSearch("");
     void loadPaidTicketsForRefund().catch(() => {
       setPaidTicketsForRefund([]);
-      setError("Failed to load paid tickets.");
     });
   }
 
@@ -1066,74 +1308,81 @@ export function PosPage() {
 
   async function submitRefundFromPicker(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (!refundSelected) return;
+    if (!refundSelected || refundBusy) return;
     const fd = new FormData(e.currentTarget);
     const reason = String(fd.get("reason") ?? "").trim();
     if (!reason) return;
     const amountCentavos = Math.round(Number(fd.get("pesos") ?? "0") * 100);
     if (amountCentavos <= 0) {
-      setError("Enter a valid refund amount.");
+      emitToast("error", "Enter a valid refund amount.");
       return;
     }
+    const note = String(fd.get("note") ?? "").trim() || undefined;
+    const ticketNo = String(refundSelected.ticket_no).padStart(4, "0");
     setRefundBusy(true);
-    const seq = ++lastRequestSeq.current;
     try {
-      await api(`/tickets/${refundSelected.id}/refunds`, {
-        method: "POST",
-        json: {
-          amountCentavos,
-          reason,
-          note: String(fd.get("note") ?? "") || undefined,
+      await confirmManagerPin({
+        title: "Approve refund",
+        description: `Manager or owner approval required to refund ${formatPhp(amountCentavos)} for ticket #${ticketNo}.`,
+        action: async ({ staffCode, pin }) => {
+          await api(`/tickets/${refundSelected.id}/refunds`, {
+            method: "POST",
+            json: {
+              amountCentavos,
+              reason,
+              note,
+              approverStaffCode: staffCode,
+              approverPin: pin,
+            },
+          });
         },
       });
-      if (seq === lastRequestSeq.current) {
-        closeRefundPicker();
-        publishAnalyticsUpdate();
-        setNotice("Refund recorded");
-      }
-    } catch {
-      if (seq === lastRequestSeq.current) {
-        setError("Failed to record refund.");
-      }
+      closeRefundPicker();
+      publishAnalyticsUpdate();
+      emitToast("success", `Refund recorded for ticket #${ticketNo}.`);
+    } catch (err) {
+      if (err instanceof ManagerPinCancelledError) return;
     } finally {
-      if (seq === lastRequestSeq.current) setRefundBusy(false);
+      setRefundBusy(false);
     }
   }
 
   async function voidWholeTicket() {
-    const reason = window.prompt("Void entire ticket? Type reason:");
-    if (!reason || !ticketId) return;
-    await api(`/tickets/${ticketId}/void-ticket`, { method: "POST", json: { reason } });
-    newTicket();
-    publishKdsUpdate("ticket_voided");
-    setNotice("Ticket voided");
-  }
-
-  const pending = payments.filter((p) => p.status === "pending_ewallet");
-  const paidCompleted = payments.filter((p) => p.status === "completed");
-  const cashTenderedCentavos = Math.round((Number(cashPesosInput || "0") || 0) * 100);
-  const cashDeltaCentavos = totals ? cashTenderedCentavos - totals.remainingDueCentavos : 0;
-  const canPaySplit = Boolean(ticketId && totals && selectedTicketType && demographicColor);
-
-  async function updateTicketMeta(meta: { demographicColor?: string; customerId?: string }) {
     if (!ticketId) return;
-    const seq = ++lastRequestSeq.current;
+    const reason = await prompt({
+      title: "Void ticket",
+      message: "Void entire ticket? Enter a reason.",
+      placeholder: "Reason for void",
+      required: true,
+      confirmLabel: "Continue",
+    });
+    if (!reason) return;
     try {
-      const res = await api<any>(`/tickets/${ticketId}/meta`, { method: "PATCH", json: meta });
-      if (seq === lastRequestSeq.current) {
-        updateTicketState(res);
-        setNotice("Ticket metadata updated");
-      }
-    } catch {
-      if (seq === lastRequestSeq.current) {
-        refreshTicket(ticketId);
-        setError("Failed to update ticket metadata.");
-      }
+      await confirmManagerPin({
+        title: "Approve void",
+        description: "Manager or owner approval required to void this ticket.",
+        action: async ({ staffCode, pin }) => {
+          await api(`/tickets/${ticketId}/void-ticket`, {
+            method: "POST",
+            json: { reason, approverStaffCode: staffCode, approverPin: pin },
+          });
+          newTicket();
+          publishKdsUpdate("ticket_voided");
+          emitToast("success", "Ticket voided.");
+        },
+      });
+    } catch (err) {
+      if (err instanceof ManagerPinCancelledError) return;
     }
   }
 
-  const canVoid = me && isManager(me.role);
-  const canRefund = Boolean(canVoid);
+  const paidCompleted = payments.filter((p) => p.status === "completed");
+  const cashTenderedCentavos = Math.round((Number(cashPesosInput || "0") || 0) * 100);
+  const cashDeltaCentavos = totals ? cashTenderedCentavos - totals.remainingDueCentavos : 0;
+  const canPaySplit = Boolean(ticketId && totals && selectedTicketType);
+
+  const canVoid = Boolean(me);
+  const canRefund = Boolean(me);
 
   const filteredPaidTickets = useMemo(() => {
     const q = refundSearch.trim().toLowerCase().replace(/^#/, "");
@@ -1147,7 +1396,6 @@ export function PosPage() {
   return (
     <div className="pos-page stack" style={{ gap: 16 }}>
       {bootLoading ? <div className="card muted">Loading POS data…</div> : null}
-      {error ? <div className="error">{error}</div> : null}
 
       <div className="panel-split pos-layout">
         <div className="pos-main-column stack">
@@ -1263,48 +1511,34 @@ export function PosPage() {
 
         <aside className="cart stack pos-cart-panel">
           {parkedTickets.length > 0 ? (
-            <div className="parked-queue">
-              <div className="parked-queue-header">
-                <span className="parked-queue-title">Parked orders</span>
-                <span className="parked-queue-count">{parkedTickets.length}</span>
-              </div>
-              <div className="parked-queue-list">
-                {parkedTickets.map((row) => {
-                  const label = String(row.parked_label ?? "").trim() || formatTicketLabel(row.id, Number(row.ticket_no ?? 0) || null);
-                  const qty = Number(row.item_qty ?? 0);
-                  const due = Number(row.due_centavos ?? 0);
-                  const isActive = ticketId === row.id;
-                  return (
-                    <button
-                      key={row.id}
-                      type="button"
-                      className={`parked-queue-item${isActive ? " is-active" : ""}`}
-                      disabled={busy}
-                      onClick={() => void resumeParkedTicket(row)}
-                    >
-                      <div className="parked-queue-item-main">
-                        <span className="parked-queue-name">{label}</span>
-                        <span className="parked-queue-meta">
-                          {formatTicketLabel(row.id, Number(row.ticket_no ?? 0) || null)}
-                          {qty > 0 ? ` · ${qty} item${qty === 1 ? "" : "s"}` : ""}
-                        </span>
-                      </div>
-                      <div className="parked-queue-item-side">
-                        {due > 0 ? <span className="parked-queue-due">{formatPhp(due)}</span> : null}
-                        <span className="parked-queue-time">{formatParkedWhen(row.updated_at)}</span>
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            <button
+              type="button"
+              className="parked-orders-label"
+              onClick={() => setParkModalOpen(true)}
+              title="View parked orders"
+            >
+              Parked Orders {parkedTickets.length}
+            </button>
           ) : null}
 
           <div className="row" style={{ justifyContent: "space-between" }}>
             <strong>Ticket</strong>
             <span className="muted">{formatTicketLabel(ticketId, ticketNumber)}</span>
           </div>
-          <div className="muted">Status: {ticketStatus || "—"}</div>
+          <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+            <div className="muted">Status: {ticketStatus || "—"}</div>
+            {ticketId && ticketStatus !== "paid" && ticketStatus !== "voided" ? (
+              <button type="button" className="ghost-btn tiny-btn" onClick={() => void editTicketNote()}>
+                <span aria-hidden="true" style={{ marginRight: 4 }}>📝</span>
+                {ticketNotes ? "Edit note" : "Add note"}
+              </button>
+            ) : null}
+          </div>
+          {ticketNotes ? (
+            <div style={{ color: "var(--color-primary)", fontWeight: "bold", paddingBottom: "8px" }}>
+              Note: {ticketNotes}
+            </div>
+          ) : null}
 
           <div className="cart-lines">
             {lines.map((li) => {
@@ -1316,6 +1550,11 @@ export function PosPage() {
             <div key={li.id} className="line">
               <div className="stack" style={{ gap: 4, flex: 1 }}>
                 <strong>{li.product_name ?? "Item"}</strong>
+                {li.line_notes && li.line_notes !== "[FREEBIE]" ? (
+                  <span className="muted" style={{ fontSize: 13, color: "var(--color-primary)", fontWeight: 600 }}>
+                    Note: {li.line_notes.replace("[FREEBIE] ", "").replace("[FREEBIE]", "")}
+                  </span>
+                ) : null}
                 <span className="muted" style={{ fontSize: 13 }}>
                   Qty {li.qty} × {formatPhp(li.unit_price_centavos)}
                 </span>
@@ -1381,20 +1620,18 @@ export function PosPage() {
                     <path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"></path>
                   </svg>
                 </button>
-                {canVoid ? (
-                  <button
-                    type="button"
-                    className="cart-action-btn is-danger"
-                    title="Void line item"
-                    aria-label="Void line item"
-                    onClick={() => void voidLine(li)}
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <circle cx="12" cy="12" r="10"></circle>
-                      <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line>
-                    </svg>
-                  </button>
-                ) : null}
+                <button
+                  type="button"
+                  className={`cart-action-btn ${li.line_notes && li.line_notes !== "[FREEBIE]" ? "is-active" : ""}`}
+                  title="Add note"
+                  aria-label="Add note"
+                  onClick={() => void editLineNote(li)}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 20h9"></path>
+                    <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+                  </svg>
+                </button>
               </div>
             </div>
             );
@@ -1418,80 +1655,6 @@ export function PosPage() {
                 >
                   Dine-in
                 </button>
-              </div>
-              <div className="stack" style={{ gap: 8 }}>
-                <button
-                  type="button"
-                  className="ghost-btn tiny-btn"
-                  style={{ alignSelf: "flex-start" }}
-                  onClick={() => setDemographicExpanded((prev) => !prev)}
-                >
-                  {demographicExpanded ? "Hide demographic" : demographicColor ? "Show demographic (selected)" : "Show demographic"}
-                </button>
-                {demographicExpanded ? (
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
-                    {[
-                      { value: "blue", label: "Student", bg: "#3b82f6" },
-                      { value: "green", label: "Pro", bg: "#22c55e" },
-                      { value: "red", label: "Family", bg: "#ef4444" },
-                      { value: "yellow", label: "Senior", bg: "#eab308" },
-                      { value: "purple", label: "Tourist", bg: "#a855f7" },
-                      { value: "orange", label: "Couple", bg: "#f97316" },
-                      { value: "pink", label: "Teen", bg: "#ec4899" },
-                      { value: "brown", label: "Group", bg: "#8b4513" },
-                    ].map((c) => (
-                      <button
-                        key={c.value}
-                        type="button"
-                        onClick={async () => {
-                          await updateTicketMeta({ demographicColor: demographicColor === c.value ? "" : c.value });
-                          if (demographicColor !== c.value) setDemographicExpanded(false);
-                        }}
-                        style={{
-                          display: "flex",
-                          flexDirection: "column",
-                          alignItems: "center",
-                          gap: 6,
-                          padding: "10px 4px",
-                          borderRadius: 12,
-                          background: demographicColor === c.value ? `${c.bg}15` : "#fff",
-                          border: `1px solid ${demographicColor === c.value ? c.bg : "var(--border)"}`,
-                          cursor: "pointer",
-                          transition: "all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1)",
-                          boxShadow: demographicColor === c.value ? `0 4px 12px ${c.bg}30` : "0 2px 4px rgba(0,0,0,0.02)",
-                          transform: demographicColor === c.value ? "translateY(-2px)" : "none",
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: 28,
-                            height: 28,
-                            borderRadius: "50%",
-                            background: c.bg,
-                            boxShadow: "inset 0 2px 4px rgba(255,255,255,0.4), 0 2px 5px rgba(0,0,0,0.1)",
-                            border: demographicColor === c.value ? "2px solid #fff" : "2px solid transparent",
-                            outline: demographicColor === c.value ? `2px solid ${c.bg}` : "none",
-                          }}
-                        />
-                        <span
-                          style={{
-                            fontSize: 10,
-                            fontWeight: 700,
-                            color: demographicColor === c.value ? c.bg : "var(--muted)",
-                            textTransform: "uppercase",
-                            letterSpacing: "0.02em",
-                          }}
-                        >
-                          {c.label}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                ) : (
-                  <span className="muted" style={{ fontSize: 12 }}>
-                    {demographicColor ? "Demographic selected" : "No demographic selected"}
-                  </span>
-                )}
               </div>
             </div>
           ) : null}
@@ -1538,16 +1701,7 @@ export function PosPage() {
             </div>
           ) : null}
 
-          {pending.length > 0 ? <GcashCustomerPanel ew={ewalletUi} /> : null}
-          {pending.map((p) => (
-            <div key={p.id} className="stack" style={{ gap: 8 }}>
-              <div className="muted">Pending GCash {formatPhp(p.amount_centavos)}</div>
-              <button type="button" className="primary-btn" onClick={() => void confirmPayment(p.id)}>
-                <span className="btn-icon">✔</span>
-                <span>Confirm GCash received</span>
-              </button>
-            </div>
-          ))}
+
 
           {paidCompleted.length ? (
             <div className="muted" style={{ fontSize: 13 }}>
@@ -1590,77 +1744,67 @@ export function PosPage() {
             <p className="muted">
               Remaining due: <strong>{formatPhp(totals.remainingDueCentavos)}</strong>
             </p>
-            <GcashCustomerPanel ew={ewalletUi} />
             <div className="row" style={{ gap: 8 }}>
               <button
                 type="button"
                 className={payTab === "cash" ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
                 onClick={() => setPayTab("cash")}
               >
-                Record cash
+                Cash
               </button>
               <button
                 type="button"
                 className={payTab === "gcash" ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
                 onClick={() => setPayTab("gcash")}
               >
-                Start GCash
+                GCash
+              </button>
+              <button
+                type="button"
+                className={payTab === "bank_transfer" ? "primary-btn tiny-btn" : "ghost-btn tiny-btn"}
+                onClick={() => setPayTab("bank_transfer")}
+              >
+                Bank Transfer
               </button>
             </div>
-            {payTab === "cash" ? (
-              <form className="stack" onSubmit={payCash} autoComplete="off">
-                <div className="label">Cash amount (PHP)</div>
-                <input
-                  className="field"
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  value={cashPesosInput}
-                  onChange={(e) => setCashPesosInput(e.target.value)}
-                  autoComplete="off"
-                  placeholder="0.00"
-                  required
-                />
-                <div className="label">Rounding adjustment (centavos, optional)</div>
-                <input className="field" name="roundingCentavos" type="number" step="1" defaultValue={0} />
-                <div className="stack" style={{ gap: 4, border: "1px solid var(--border)", borderRadius: 10, padding: 10 }}>
-                  <div className="row" style={{ justifyContent: "space-between" }}>
-                    <span className="muted">Tendered</span>
-                    <strong>{formatPhp(cashTenderedCentavos)}</strong>
-                  </div>
-                  <div className="row" style={{ justifyContent: "space-between" }}>
-                    <span className="muted">Remaining due</span>
-                    <strong>{formatPhp(totals.remainingDueCentavos)}</strong>
-                  </div>
-                  <div className="row" style={{ justifyContent: "space-between" }}>
-                    <span className="muted">{cashDeltaCentavos >= 0 ? "Change" : "Still due"}</span>
-                    <strong style={{ color: cashDeltaCentavos >= 0 ? "var(--ok)" : "var(--danger)" }}>
-                      {formatPhp(Math.abs(cashDeltaCentavos))}
-                    </strong>
-                  </div>
+            <form className="stack" onSubmit={payRecord} autoComplete="off">
+              <div className="label">Payment amount (PHP)</div>
+              <input
+                className="field"
+                type="number"
+                step="0.01"
+                min="0"
+                value={cashPesosInput}
+                onChange={(e) => setCashPesosInput(e.target.value)}
+                autoComplete="off"
+                placeholder="0.00"
+                required
+              />
+              <div className="label">Rounding adjustment (centavos, optional)</div>
+              <input className="field" name="roundingCentavos" type="number" step="1" defaultValue={0} />
+              <div className="stack" style={{ gap: 4, border: "1px solid var(--border)", borderRadius: 10, padding: 10 }}>
+                <div className="row" style={{ justifyContent: "space-between" }}>
+                  <span className="muted">Tendered</span>
+                  <strong>{formatPhp(cashTenderedCentavos)}</strong>
                 </div>
-                <button className="primary-btn" type="submit" disabled={cashDeltaCentavos < 0}>
-                  <span className="btn-icon">🧾</span>
-                  <span>Record cash</span>
-                </button>
-              </form>
-            ) : null}
-            {payTab === "gcash" ? (
-              <form className="stack" onSubmit={payGcashStart}>
-                <div className="label">GCash amount (PHP)</div>
-                <input className="field" name="pesos" type="number" step="0.01" min="0" defaultValue={(totals.remainingDueCentavos / 100).toFixed(2)} required />
-                <div className="label">Reference (optional)</div>
-                <input className="field" name="ref" />
-                <div className="label">Rounding (centavos)</div>
-                <input className="field" name="roundingCentavos" type="number" defaultValue={0} />
-                <button className="primary-btn" type="submit">
-                  <span className="btn-icon">📲</span>
-                  <span>Start GCash</span>
-                </button>
-              </form>
-            ) : null}
+                <div className="row" style={{ justifyContent: "space-between" }}>
+                  <span className="muted">Remaining due</span>
+                  <strong>{formatPhp(totals.remainingDueCentavos)}</strong>
+                </div>
+                <div className="row" style={{ justifyContent: "space-between" }}>
+                  <span className="muted">{cashDeltaCentavos >= 0 ? "Change" : "Still due"}</span>
+                  <strong style={{ color: cashDeltaCentavos >= 0 ? "var(--ok)" : "var(--danger)" }}>
+                    {formatPhp(Math.abs(cashDeltaCentavos))}
+                  </strong>
+                </div>
+              </div>
+              <button className="primary-btn" type="submit" disabled={cashDeltaCentavos < 0}>
+                <span className="btn-icon">🧾</span>
+                <span>Record {payTab === "cash" ? "Cash" : payTab === "gcash" ? "GCash" : "Bank Transfer"} Payment</span>
+              </button>
+            </form>
             {totals.remainingDueCentavos === 0 ? (
-              <button type="button" className="primary-btn" onClick={() => void closeMarketingFreebieTicket()}>
+              <button type="button" className="primary-btn" onClick={() => openMarketingFreebieModal()}>
                 <span className="btn-icon">📣</span>
                 <span>Submit as marketing freebie</span>
               </button>
@@ -1896,11 +2040,10 @@ export function PosPage() {
               <h2 style={{ margin: 0 }}>
                 Receipt {cashReceiptDetail?.ticket?.ticket_no ? `#${String(cashReceiptDetail.ticket.ticket_no).padStart(4, "0")}` : ""}
               </h2>
-              <button type="button" className="ghost-btn tiny-btn" onClick={() => { setCashReceiptModal(false); setCashReceiptDetail(null); setCashReceiptError(null); }}>✕ Close</button>
+              <button type="button" className="ghost-btn tiny-btn" onClick={() => { setCashReceiptModal(false); setCashReceiptDetail(null); }}>✕ Close</button>
             </div>
             {cashReceiptLoading ? <div className="muted">Loading ticket receipt...</div> : null}
-            {cashReceiptError ? <div style={{ color: "#ef4444", fontSize: 13 }}>{cashReceiptError}</div> : null}
-            {cashReceiptDetail && !cashReceiptLoading && !cashReceiptError ? (
+            {cashReceiptDetail && !cashReceiptLoading ? (
               <>
                 <div style={{ display: "grid", placeItems: "center", padding: "6px 0 2px" }}>
                   <div
@@ -1953,7 +2096,7 @@ export function PosPage() {
                   >
                     Print Receipt
                   </button>
-                  <button type="button" className="ghost-btn" onClick={() => { setCashReceiptModal(false); setCashReceiptDetail(null); setCashReceiptError(null); }}>
+                  <button type="button" className="ghost-btn" onClick={() => { setCashReceiptModal(false); setCashReceiptDetail(null); }}>
                     Close
                   </button>
                 </div>
@@ -1962,6 +2105,30 @@ export function PosPage() {
           </div>
         </div>
       ) : null}
+      {marketingFreebieOpen ? (
+        <div className="sheet" role="dialog">
+          <div className="sheet-inner stack" style={{ maxWidth: 440 }}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+              <h2 style={{ margin: 0 }}>Marketing freebie</h2>
+              <button type="button" className="ghost-btn tiny-btn" onClick={() => setMarketingFreebieOpen(false)}>✕</button>
+            </div>
+            <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+              Optional details for this marketing freebie ticket.
+            </p>
+            <form className="stack" onSubmit={(e) => void closeMarketingFreebieTicket(e)}>
+              <input className="field" name="influencerName" placeholder="Influencer name (optional)" autoFocus />
+              <input className="field" name="campaign" placeholder="Campaign name (optional)" />
+              <input className="field" name="note" placeholder="Marketing note (optional)" />
+              <div className="row" style={{ gap: 8, justifyContent: "flex-end" }}>
+                <button type="button" className="ghost-btn" onClick={() => setMarketingFreebieOpen(false)}>Cancel</button>
+                <button type="submit" className="primary-btn">Submit freebie</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+      {inputDialogs}
+      {managerPinModal}
     </div>
   );
 }

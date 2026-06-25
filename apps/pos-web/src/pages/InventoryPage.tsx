@@ -1,10 +1,10 @@
 import { FormEvent, useEffect, useState } from "react";
 import { api } from "../api.js";
+import { emitToast } from "../ui/ToastProvider.js";
 
 export function InventoryPage() {
   const [stock, setStock] = useState<Record<string, unknown>[]>([]);
   const [ingredients, setIngredients] = useState<Record<string, unknown>[]>([]);
-  const [msg, setMsg] = useState<string | null>(null);
 
   async function load() {
     const [s, i] = await Promise.all([
@@ -30,12 +30,16 @@ export function InventoryPage() {
   async function addIngredient(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const fd = new FormData(e.currentTarget);
-    await api("/inventory/ingredients", {
-      method: "POST",
-      json: { name: String(fd.get("name")), unit: String(fd.get("unit")) },
-    });
-    e.currentTarget.reset();
-    setMsg("Ingredient added");
+    try {
+      await api("/inventory/ingredients", {
+        method: "POST",
+        json: { name: String(fd.get("name")), unit: String(fd.get("unit")) },
+      });
+      e.currentTarget.reset();
+      emitToast("success", "Ingredient added");
+    } catch {
+      // API error toast handled by api()
+    }
   }
 
   return (
@@ -71,7 +75,6 @@ export function InventoryPage() {
           </div>
         ))}
       </div>
-      {msg ? <div className="muted">{msg}</div> : null}
     </div>
   );
 }

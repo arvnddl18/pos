@@ -4,9 +4,11 @@ import type { AppEnv } from "../ctx.js";
 import { requireAuth } from "../middleware/session.js";
 import { requireManager } from "../middleware/rbac.js";
 import { writeAudit } from "../audit.js";
+import { verifyManagerCredentials } from "../lib/manager_auth.js";
 import { resolveLineItemPricing } from "../lib/line_pricing.js";
-import { computeTicketTotals, sumLineSubtotalCentavos, getTicketAdjustments, computeTicketTotalsFromRows } from "../lib/ticket_totals.js";
+import { computeTicketDueCentavos, computeTicketTotals, sumLineSubtotalCentavos, getTicketAdjustments, computeTicketTotalsFromRows } from "../lib/ticket_totals.js";
 import { buildReceiptPayload } from "./receipt_helpers.js";
+import { finalizeIfPaid, sumCompletedPaymentsCentavos } from "../lib/ticket_finalize.js";
 
 export const ticketRoutes = new Hono<AppEnv>();
 
@@ -154,17 +156,41 @@ ticketRoutes.get("/open", requireAuth(), async (c) => {
     `SELECT t.id, t.ticket_no, t.status, t.ticket_type, t.parked_label, t.table_ref, t.created_at, t.updated_at,
        (SELECT COUNT(*) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as line_count,
        (SELECT COALESCE(SUM(li.qty), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as item_qty,
-       (SELECT COALESCE(SUM(li.unit_price_centavos * li.qty - li.discount_centavos), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as due_centavos
+       (SELECT COALESCE(SUM(li.unit_price_centavos * li.qty - li.discount_centavos), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as due_centavos,
+       (SELECT COUNT(*) FROM payments p WHERE p.ticket_id = t.id AND p.status = 'pending_ewallet') as pending_payment_count,
+       (SELECT COALESCE(SUM(p.amount_centavos), 0) FROM payments p WHERE p.ticket_id = t.id AND p.status = 'completed') as paid_centavos
      FROM tickets t
      WHERE t.org_id = ? AND t.register_id = ? AND ${statusClause}
      ORDER BY CASE WHEN t.status = 'parked' THEN 0 ELSE 1 END, t.updated_at ASC`,
   )
     .bind(auth.orgId, registerId)
     .all<Record<string, unknown>>();
-  return c.json({ tickets: rows.results ?? [] });
+
+  const tickets = rows.results ?? [];
+  for (const t of tickets) {
+    if (t.status === "open" || t.status === "parked") {
+      await finalizeIfPaid(c.env.DB, String(t.id), auth.orgId);
+    }
+  }
+
+  const refreshed = await c.env.DB.prepare(
+    `SELECT t.id, t.ticket_no, t.status, t.ticket_type, t.parked_label, t.table_ref, t.created_at, t.updated_at,
+       (SELECT COUNT(*) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as line_count,
+       (SELECT COALESCE(SUM(li.qty), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as item_qty,
+       (SELECT COALESCE(SUM(li.unit_price_centavos * li.qty - li.discount_centavos), 0) FROM line_items li WHERE li.ticket_id = t.id AND li.voided = 0) as due_centavos,
+       (SELECT COUNT(*) FROM payments p WHERE p.ticket_id = t.id AND p.status = 'pending_ewallet') as pending_payment_count,
+       (SELECT COALESCE(SUM(p.amount_centavos), 0) FROM payments p WHERE p.ticket_id = t.id AND p.status = 'completed') as paid_centavos
+     FROM tickets t
+     WHERE t.org_id = ? AND t.register_id = ? AND ${statusClause}
+     ORDER BY CASE WHEN t.status = 'parked' THEN 0 ELSE 1 END, t.updated_at ASC`,
+  )
+    .bind(auth.orgId, registerId)
+    .all<Record<string, unknown>>();
+
+  return c.json({ tickets: refreshed.results ?? [] });
 });
 
-ticketRoutes.get("/paid", requireAuth(), requireManager(), async (c) => {
+ticketRoutes.get("/paid", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
   const q = (c.req.query("q") ?? "").trim();
   const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? "50")));
@@ -254,6 +280,35 @@ ticketRoutes.patch("/:id/park", requireAuth(), async (c) => {
   const ticketId = c.req.param("id");
   const Body = z.object({ parkedLabel: z.string().min(1).max(100) });
   const body = Body.parse(await c.req.json());
+
+  const ticket = await c.env.DB.prepare(`SELECT id, status FROM tickets WHERE id = ? AND org_id = ?`)
+    .bind(ticketId, auth.orgId)
+    .first<{ id: string; status: string }>();
+  if (!ticket) return c.json({ error: "not_found" }, 404);
+  if (ticket.status === "paid" || ticket.status === "voided") {
+    return c.json({ error: "ticket_closed" }, 400);
+  }
+
+  if (await finalizeIfPaid(c.env.DB, ticketId, auth.orgId)) {
+    const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
+    return c.json({ ok: true, finalized: true, ...payload });
+  }
+
+  const due = await computeTicketDueCentavos(c.env.DB, ticketId);
+  const paid = await sumCompletedPaymentsCentavos(c.env.DB, ticketId);
+  if (paid > 0 && paid >= due) {
+    return c.json({ error: "cannot_park_ticket_with_completed_payments" }, 400);
+  }
+
+  const itemQty = await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(qty), 0) as qty FROM line_items WHERE ticket_id = ? AND voided = 0`,
+  )
+    .bind(ticketId)
+    .first<{ qty: number }>();
+  if (Number(itemQty?.qty ?? 0) === 0) {
+    return c.json({ error: "cannot_park_empty_ticket" }, 400);
+  }
+
   const now = new Date().toISOString();
   const res = await c.env.DB.prepare(
     `UPDATE tickets SET status = 'parked', parked_label = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status = 'open'`,
@@ -318,6 +373,7 @@ const TicketMetaIn = z.object({
   feedbackRating: z.number().int().min(1).max(5).optional(),
   feedbackNotes: z.string().optional(),
   customerId: z.string().uuid().optional(),
+  notes: z.string().optional(),
 });
 
 ticketRoutes.patch("/:id/meta", requireAuth(), async (c) => {
@@ -343,6 +399,10 @@ ticketRoutes.patch("/:id/meta", requireAuth(), async (c) => {
     sets.push("customer_id = ?");
     vals.push(body.customerId);
   }
+  if (body.notes !== undefined) {
+    sets.push("notes = ?");
+    vals.push(body.notes);
+  }
 
   if (sets.length === 0) return c.json({ ok: true });
 
@@ -354,12 +414,20 @@ ticketRoutes.patch("/:id/meta", requireAuth(), async (c) => {
   return c.json({ ok: true, ...payload });
 });
 
-const VoidTicketIn = z.object({ reason: z.string().min(1).max(500) });
+const ManagerApprovalIn = z.object({
+  approverStaffCode: z.string().min(1),
+  approverPin: z.string().min(4),
+});
 
-ticketRoutes.post("/:id/void-ticket", requireAuth(), requireManager(), async (c) => {
+const VoidTicketIn = z.object({ reason: z.string().min(1).max(500) }).merge(ManagerApprovalIn);
+
+ticketRoutes.post("/:id/void-ticket", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
   const ticketId = c.req.param("id");
   const body = VoidTicketIn.parse(await c.req.json());
+
+  const approver = await verifyManagerCredentials(c.env.DB, auth.orgId, body.approverStaffCode, body.approverPin);
+  if (!approver) return c.json({ error: "invalid_manager_credentials" }, 401);
 
   const ticket = await c.env.DB.prepare(`SELECT id, status FROM tickets WHERE id = ? AND org_id = ?`).bind(ticketId, auth.orgId).first<{
     id: string;
@@ -372,6 +440,15 @@ ticketRoutes.post("/:id/void-ticket", requireAuth(), requireManager(), async (c)
     return c.json({ error: "cannot_void_ticket_with_completed_payments" }, 400);
   }
 
+  const linesToVoid = await c.env.DB.prepare(
+    `SELECT li.id, li.qty, li.unit_price_centavos, li.discount_centavos, p.name AS product_name
+     FROM line_items li
+     JOIN products p ON p.id = li.product_id
+     WHERE li.ticket_id = ? AND li.voided = 0`
+  )
+    .bind(ticketId)
+    .all<{ id: string; qty: number; unit_price_centavos: number; discount_centavos: number | null; product_name: string }>();
+
   const now = new Date().toISOString();
   await c.env.DB.prepare(
     `UPDATE line_items SET voided = 1, void_reason = ?, voided_by = ? WHERE ticket_id = ? AND voided = 0`,
@@ -383,6 +460,27 @@ ticketRoutes.post("/:id/void-ticket", requireAuth(), requireManager(), async (c)
     .bind(body.reason, now, ticketId, auth.orgId)
     .run();
 
+  for (const line of linesToVoid.results ?? []) {
+    await writeAudit({
+      db: c.env.DB,
+      orgId: auth.orgId,
+      userId: auth.id,
+      action: "line.void",
+      entityType: "line_item",
+      entityId: line.id,
+      payload: {
+        reason: body.reason,
+        ticketId,
+        productName: line.product_name,
+        qty: line.qty,
+        unitPriceCentavos: line.unit_price_centavos,
+        discountCentavos: line.discount_centavos ?? 0,
+        approvedBy: approver.id,
+        approvedByStaffCode: approver.staffCode,
+      },
+    });
+  }
+
   await writeAudit({
     db: c.env.DB,
     orgId: auth.orgId,
@@ -390,7 +488,7 @@ ticketRoutes.post("/:id/void-ticket", requireAuth(), requireManager(), async (c)
     action: "ticket.void",
     entityType: "ticket",
     entityId: ticketId,
-    payload: body,
+    payload: { reason: body.reason, approvedBy: approver.id, approvedByStaffCode: approver.staffCode },
   });
 
   return c.json({ ok: true });
@@ -555,7 +653,7 @@ ticketRoutes.delete("/:ticketId/lines/:lineId", requireAuth(), async (c) => {
   return c.json({ ok: true, ...payload });
 });
 
-const VoidLine = z.object({ reason: z.string().min(1).max(500) });
+const VoidLine = z.object({ reason: z.string().min(1).max(500) }).merge(ManagerApprovalIn);
 
 ticketRoutes.post("/:ticketId/lines/:lineId/void", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
@@ -563,7 +661,8 @@ ticketRoutes.post("/:ticketId/lines/:lineId/void", requireAuth(), async (c) => {
   const lineId = c.req.param("lineId");
   const body = VoidLine.parse(await c.req.json());
 
-  if (auth.role !== "manager" && auth.role !== "owner") return c.json({ error: "manager_required" }, 403);
+  const approver = await verifyManagerCredentials(c.env.DB, auth.orgId, body.approverStaffCode, body.approverPin);
+  if (!approver) return c.json({ error: "invalid_manager_credentials" }, 401);
 
   const row = await c.env.DB.prepare(
     `SELECT li.id FROM line_items li JOIN tickets t ON t.id = li.ticket_id WHERE li.id = ? AND li.ticket_id = ? AND t.org_id = ?`,
@@ -571,6 +670,15 @@ ticketRoutes.post("/:ticketId/lines/:lineId/void", requireAuth(), async (c) => {
     .bind(lineId, ticketId, auth.orgId)
     .first<{ id: string }>();
   if (!row) return c.json({ error: "not_found" }, 404);
+
+  const lineDetail = await c.env.DB.prepare(
+    `SELECT li.qty, li.unit_price_centavos, li.discount_centavos, p.name AS product_name
+     FROM line_items li
+     JOIN products p ON p.id = li.product_id
+     WHERE li.id = ? AND li.ticket_id = ?`,
+  )
+    .bind(lineId, ticketId)
+    .first<{ qty: number; unit_price_centavos: number; discount_centavos: number | null; product_name: string }>();
 
   const now = new Date().toISOString();
   await c.env.DB.prepare(
@@ -586,7 +694,16 @@ ticketRoutes.post("/:ticketId/lines/:lineId/void", requireAuth(), async (c) => {
     action: "line.void",
     entityType: "line_item",
     entityId: lineId,
-    payload: body,
+    payload: {
+      reason: body.reason,
+      ticketId,
+      productName: lineDetail?.product_name ?? null,
+      qty: lineDetail?.qty ?? null,
+      unitPriceCentavos: lineDetail?.unit_price_centavos ?? null,
+      discountCentavos: lineDetail?.discount_centavos ?? 0,
+      approvedBy: approver.id,
+      approvedByStaffCode: approver.staffCode,
+    },
   });
   const payload = await getTicketDetailPayload(c.env.DB, ticketId, auth.orgId);
   return c.json({ ok: true, ...payload });
@@ -659,6 +776,13 @@ ticketRoutes.post("/:id/merge-from", requireAuth(), requireManager(), async (c) 
 ticketRoutes.get("/:id", requireAuth(), async (c) => {
   const auth = c.get("auth")!;
   const id = c.req.param("id");
+  const ticket = await c.env.DB.prepare(`SELECT status FROM tickets WHERE id = ? AND org_id = ?`)
+    .bind(id, auth.orgId)
+    .first<{ status: string }>();
+  if (!ticket) return c.json({ error: "not_found" }, 404);
+  if (ticket.status === "open" || ticket.status === "parked") {
+    await finalizeIfPaid(c.env.DB, id, auth.orgId);
+  }
   const payload = await getTicketDetailPayload(c.env.DB, id, auth.orgId);
   if (!payload) return c.json({ error: "not_found" }, 404);
   return c.json(payload);

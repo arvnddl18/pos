@@ -34,7 +34,7 @@ staffAdminRoutes.post("/users", requireAuth(), requireManager(), async (c) => {
     return c.json({ error: "duplicate_staff_code" }, 400);
   }
 
-  await writeAudit({ db: c.env.DB, orgId: auth.orgId, userId: auth.id, action: "staff.create", entityId: id, payload: { staffCode: body.staffCode, role: body.role } });
+  await writeAudit({ db: c.env.DB, orgId: auth.orgId, userId: auth.id, action: "staff.create", entityId: id, payload: { staffCode: body.staffCode, displayName: body.displayName, role: body.role } });
 
   return c.json({ id });
 });
